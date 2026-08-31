@@ -1,0 +1,557 @@
+# Midi Render Pipeline patch registry.
+# Paths are relative to this config file unless a library/plugin path is absolute.
+
+[paths]
+instruments = "../resources/instruments"
+fx = "../resources/fx"
+lv2 = "../resources/fx/lv2"
+tools = "../resources/tools"
+
+[master]
+normalize_peak_db = -1.0
+gain_db = -10.0
+
+# Melody is a dataset role, not a fixed instrument. `auto` keeps the source GM
+# Program as the timbre hint, preferring our dedicated/family patches first.
+# Alternatives:
+#   mode = "gm"          # bypass dedicated patches; optional gm_program = 73
+#   mode = "instrument"  # force a canonical source; set instrument = "flute"
+[melody]
+mode = "gm"
+gm_program = 71
+
+
+# Performance Adapter normalizes source-MIDI velocity semantics before the
+# sampler. Constant-like tracks are canonicalized to one nominal playing
+# intensity; genuinely dynamic tracks keep their contour but are recentered and
+# robustly scaled into the instrument's safe performance range. Track loudness
+# remains the job of patch gain_db / the mixer, not raw MIDI velocity.
+[performance]
+enabled = true
+constant_spread_max = 4.0
+low_percentile = 0.10
+high_percentile = 0.90
+max_expand_ratio = 1.5
+
+# First calibrated profiles are deliberately limited to the two instruments for
+# which the source corpus already showed clear cross-MIDI velocity-scale drift.
+# Add more instruments here only after their sampler operating range is audited.
+[performance.instruments.electric_bass]
+velocity_min = 50
+velocity_nominal = 60
+velocity_max = 65
+
+[performance.instruments.string_ensemble]
+velocity_min = 30
+velocity_nominal = 52
+velocity_max = 68
+
+[performance.instruments.acoustic_piano]
+velocity_min = 35
+velocity_nominal = 62
+velocity_max = 95
+
+[performance.instruments.acoustic_guitar]
+velocity_min = 40
+velocity_nominal = 62
+velocity_max = 82
+
+[performance.instruments.electric_guitar_clean]
+velocity_min = 30
+velocity_nominal = 52
+velocity_max = 72
+
+[performance.instruments.electric_guitar_jazz]
+velocity_min = 30
+velocity_nominal = 52
+velocity_max = 72
+
+[performance.instruments.electric_guitar_overdrive]
+velocity_min = 45
+velocity_nominal = 60
+velocity_max = 80
+
+[performance.instruments.drums]
+velocity_min = 70
+velocity_nominal = 100
+velocity_max = 122
+
+[performance.instruments.electric_piano]
+velocity_min = 35
+velocity_nominal = 62
+velocity_max = 88
+
+[libraries.jrhodes]
+root = "jRhodes3d"
+
+[libraries.mtg_solosax]
+root = "MTG Solo Saxophones"
+
+[libraries.vcsl]
+root = "VCSL-1.2.2-RC"
+
+[libraries.salamander]
+root = "AccurateSalamenderGrandPiano"
+
+[libraries.mdm_acoustic]
+root = "MDM Acoustic Guitar v1.0 WAV"
+
+[libraries.growlybass]
+root = "Growlybass"
+
+[libraries.fashionbass]
+root = "Fashionbass"
+
+[libraries.sm_drums]
+root = "SM_Drums"
+
+[libraries.muldjordkit_drums]
+root = "MuldjordKit SFZ+FLAC-20201018"
+
+[libraries.generaluser_gs]
+root = "GeneralUser-GS"
+
+[libraries.giant_soundfonts]
+root = "GiantSoundFonts"
+
+[libraries.ui_standard_guitar]
+root = "UI_Standard_Guitar"
+
+[libraries.vpo]
+root = "Virtual-Playing-Orchestra3"
+
+# FreePats FSBS archives are kept intact under the common instruments root.
+# A single root library avoids inventing another path layer for each guitar set.
+[libraries.local_instruments]
+root = "."
+
+[libraries.fsbs_clean]
+root = "EGuitarFSBS-clean SFZ+FLAC-20260807"
+
+[libraries.fsbs_jazz]
+root = "EGuitarFSBS-jazz SFZ+FLAC-20260807"
+
+[libraries.fsbs_drive1]
+root = "EGuitarFSBS-dist1 SFZ+FLAC-20220911"
+
+[libraries.fsbs_drive2]
+root = "EGuitarFSBS-dist2 SFZ+FLAC-20220911"
+
+[patches.electric_piano]
+library = "jrhodes"
+sfz = "jRhodes3d-st-no-xfade.sfz"
+gain_db = 0.0
+
+[patches.saxophone]
+library = "mtg_solosax"
+sfz = "MTG Tenor Sax.sfz"
+gain_db = 0.0
+
+[patches.acoustic_piano]
+library = "salamander"
+sfz = "sfz_daw/Accurate-SalamanderGrandPiano_flat.Recommended.sfz"
+gain_db = 1.0
+
+[patches.acoustic_guitar]
+library = "mdm_acoustic"
+sfz = "MDMAG Sustain Pick F.sfz"
+gain_db = -6.0
+
+# [patches.electric_bass]
+# library = "growlybass"
+# sfz = "growlybass_clean.sfz"
+# gain_db = -3.0
+# effects = ["gxsvt"]
+
+[patches.electric_bass]
+library = "fashionbass"
+sfz = "fashionbass_clean.sfz"
+gain_db = -3.0
+effects = ["gxsvt"]
+
+[patches.drums]
+library = "sm_drums"
+sfz = "Programs/SM_Drums_kit.sfz"
+gain_db = -2.0
+
+[patches.electric_guitar_clean]
+library = "fsbs_clean"
+sfz = "EGuitarFSBS-clean bridge 20260807.sfz"
+gain_db = -1.0
+effects = []
+# [patches.electric_guitar_clean]
+# library = "ui_standard_guitar"
+# sfz = "Programs/01-Standard Guitar KSOP.sfz"
+# gain_db = 5.0
+# effects = ["blueamp_clean", "ultracab_clean"]
+
+[patches.electric_guitar_drive]
+library = "fsbs_drive2"
+sfz = "EGuitarFSBS-dist2 bridge 20220911.sfz"
+gain_db = -2.0
+effects = []
+
+# VPO patches below intentionally use simple sustain/open/hit programs rather
+# than keyswitch or mod-wheel variants. The input corpus is not authored for
+# VPO-specific articulation control, so note/velocity-only playback is the safe
+# automatic-rendering default.
+[patches.string_ensemble]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-normal-mod-wheel-panned.sfz"
+gain_db = -2.0
+
+[patches.choir]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Vocals/choir-MIXED-sustain.sfz"
+gain_db = 0.0
+
+[patches.flute]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Woodwinds/flute-SOLO-normal-mod-wheel.sfz"
+gain_db = 5.0
+
+[patches.solo_violin]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/1st-violin-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.solo_viola]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/viola-SOLO-sustain.sfz"
+gain_db = -1.0
+
+[patches.harp]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/harp-sustain.sfz"
+gain_db = 0.0
+
+[patches.timpani]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Percussion/timpani-hit.sfz"
+gain_db = 0.0
+
+[patches.vibraphone]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Percussion/vibraphone-open.sfz"
+gain_db = -1.0
+
+[patches.brass]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Brass/all-brass-SEC-sustain.sfz"
+gain_db = 0.0
+
+[patches.horn]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Brass/french-horn-SOLO-sustain.sfz"
+gain_db = 0.0
+
+# Program-specific baked FreePats guitars. These contain their intended finished
+# clean/drive character, so no project LV2 chain is added here.
+[patches.electric_guitar_jazz]
+library = "local_instruments"
+sfz = "EGuitarFSBS-jazz SFZ+FLAC-20260807/EGuitarFSBS-jazz bridge 20260807.sfz"
+gain_db = 0.0
+effects = []
+
+[patches.electric_guitar_overdrive]
+library = "local_instruments"
+sfz = "EGuitarFSBS-dist1 SFZ+FLAC-20220911/EGuitarFSBS-dist1 bridge 20220911.sfz"
+gain_db = 0.0
+effects = []
+
+[patches.electric_guitar_distortion]
+library = "local_instruments"
+sfz = "EGuitarFSBS-dist2 SFZ+FLAC-20220911/EGuitarFSBS-dist2 bridge 20220911.sfz"
+gain_db = 0.0
+effects = []
+
+# Use the VPO instruments already present before falling back to the general GM
+# SoundFont. Simple sustain/pizzicato/tremolo programs remain the automatic-safe
+# choices; no VPO-specific keyswitch or mod-wheel authoring is assumed.
+[patches.cello]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/cello-SOLO-normal-mod-wheel.sfz"
+gain_db = -10.0
+
+[patches.contrabass]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/bass-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.string_tremolo]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-tremolo-panned.sfz"
+gain_db = 0.0
+
+[patches.string_pizzicato]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-pizzicato-panned.sfz"
+gain_db = 0.0
+
+[patches.trumpet]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Brass/trumpet-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.trombone]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Brass/trombone-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.tuba]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Brass/tuba-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.oboe]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Woodwinds/oboe-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.english_horn]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Woodwinds/english-horn-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.bassoon]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Woodwinds/bassoon-SOLO-sustain.sfz"
+gain_db = 0.0
+
+[patches.clarinet]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Woodwinds/clarinet-SOLO-normal-mod-wheel.sfz"
+gain_db = 0.0
+
+[patches.piccolo]
+library = "vpo"
+sfz = "Virtual-Playing-Orchestra3/Woodwinds/piccolo-SOLO-sustain.sfz"
+gain_db = 0.0
+
+# A family/shared patch may intentionally cover several GM programs. Exact
+# patches always win; these are consulted only when an exact patch is absent or
+# its SFZ is missing.
+[family_fallbacks]
+electric_guitar_muted = "electric_guitar_clean"
+electric_guitar_harmonics = "electric_guitar_clean"
+muted_trumpet = "trumpet"
+
+# Final coverage layer. If exact/family SFZ routing cannot render a track, keep
+# a trustworthy original Program Change and render through MuseScore General.
+# When Program Change is missing/dirty, use the representative program below.
+[general_midi_fallback]
+enabled = true
+soundfont = "MuseScore_General_Full.sf2"
+tool = "fluidsynth"
+synth_gain = 0.2
+gain_db = 6.0
+
+[general_midi_fallback.program_for_instrument]
+melody = 80
+acoustic_piano = 0
+electric_piano = 4
+chromatic_percussion = 11
+music_box = 10
+vibraphone = 11
+dulcimer = 15
+organ = 16
+accordion = 21
+harmonica = 22
+acoustic_guitar = 25
+electric_guitar_jazz = 26
+electric_guitar_clean = 27
+electric_guitar_muted = 28
+electric_guitar_overdrive = 29
+electric_guitar_distortion = 30
+electric_guitar_harmonics = 31
+electric_bass = 33
+solo_violin = 40
+solo_viola = 41
+cello = 42
+contrabass = 43
+string_tremolo = 44
+string_pizzicato = 45
+harp = 46
+timpani = 47
+string_ensemble = 48
+choir = 52
+orchestra_hit = 55
+trumpet = 56
+trombone = 57
+tuba = 58
+muted_trumpet = 59
+horn = 60
+brass = 61
+saxophone = 65
+oboe = 68
+english_horn = 69
+bassoon = 70
+clarinet = 71
+piccolo = 72
+flute = 73
+wind = 73
+synth_lead = 80
+synth_pad = 89
+synth_fx = 96
+ethnic = 104
+percussion = 114
+sound_fx = 120
+
+# Bass now uses the same native Lilv/lv2apply path as the guitar effects.
+# GxSVT contains its own cabinet stage, so CABSWITCH stays enabled rather than
+# adding a separate UltraCab after the bass amp.
+[effects.gxsvt]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_ampegsvt.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_ampegsvt_#_ampegsvt_"
+input_channels = 1
+
+[effects.gxsvt.params]
+BYPASS = 1.0
+BASS = 0.60
+MIDDLE = 0.30
+TREBLE = 0.40
+VOLUME = 0.20
+# LV2 enum numeric values: LOWSWITCH OFF=1, MIDSWITCH 800Hz=1,
+# HIGHSWITCH OFF=0, CABSWITCH ON=1.
+LOWSWITCH = 1
+MIDSWITCH = 1
+HIGHSWITCH = 0
+CABSWITCH = 1
+
+[effects.bass_room]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_room_simulator.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_room_simulator_#_room_simulator_"
+input_channels = 1
+
+[effects.bass_room.params]
+EFFECT = 1.0
+PREDELAYMS = 12.0
+RT = 0.20
+ROOMSIZE = 0.7
+DRYWET = 0.1
+
+# Generic pop-clean baseline selected for the UI Standard Guitar DI source.
+[effects.blueamp_clean]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_blueamp.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_blueamp_#_blueamp_"
+input_channels = 1
+
+[effects.blueamp_clean.params]
+BYPASS = 1.0
+MASTER = 0.50
+TONE = 0.40
+VOLUME = 0.40
+
+
+[effects.ultracab_clean]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_ultracab.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_ultracab_#_ultracab_"
+input_channels = 2
+
+[effects.ultracab_clean.params]
+BYPASS = 0.0
+GAIN = 0.30
+MIDS = 0.30
+PUNCH = 0.30
+RESONANCE = 0.45
+SIZE = 0.55
+TOP = 0.20
+
+# Generic pop/rock drive baseline. Keep the overdrive moderate; Plexi and the
+# cabinet complete the tone rather than asking the pedal to provide all gain.
+[effects.clubdrive]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_clubdrive.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_clubdrive_#_clubdrive_"
+input_channels = 1
+
+[effects.clubdrive.params]
+BYPASS = 1.0
+DRIVE = 0.00
+VOLUME = 1.0
+V1 = 0.0
+
+[effects.plexi_drive]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_plexi.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_plexi_#_plexi_"
+input_channels = 1
+
+[effects.plexi_drive.params]
+BYPASS = 1.0
+BASS = 0.30
+MASTER = 0.40
+MID = 0.45
+PRESENSE = 0.60
+TREBLE = 0.80
+VOLUME = 0.25
+
+[effects.ultracab_drive]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_ultracab.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_ultracab_#_ultracab_"
+input_channels = 2
+
+[effects.ultracab_drive.params]
+BYPASS = 0.0
+GAIN = 0.30
+MIDS = 0.30
+PUNCH = 0.30
+RESONANCE = 0.45
+SIZE = 0.55
+TOP = 0.55
+
+[effects.tube_distortion]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_TubeDistortion.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_TubeDistortion_#_TubeDistortion_"
+input_channels = 1
+
+[effects.tube_distortion.params]
+BYPASS = 1.0
+INPUT = 1.0
+OUTPUT = 0.50
+
+[effects.liquid_drive]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_liquiddrive.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_liquiddrive_#_liquiddrive_"
+input_channels = 1
+
+[effects.liquid_drive.params]
+BYPASS = 1.0
+DRIVE = 1.0
+LEVEL = -10.0
+
+[effects.guvnor_drive]
+backend = "lv2apply"
+tool = "lv2apply"
+bundle = "gx_guvnor.lv2"
+plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_guvnor_#_guvnor_"
+input_channels = 1
+
+[effects.guvnor_drive.params]
+GAIN = 0.90
+LEVEL = 0.50
+BASS = 0.35
+MID = 0.55
+TREBLE = 0.70
+
+[drum_kick_layer]
+enabled = true
+sfz = "MuldjordKit SFZ+FLAC-20201018/MuldjordKit 20201018 GM.sfz"
+notes = [35, 36]
+gain_db = -4.0

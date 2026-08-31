@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+resources/instruments/*
+!resources/instruments/.gitkeep
+resources/fx/*
+!resources/fx/.gitkeep
+resources/tools/*
+!resources/tools/.gitkeep
+renders/final/*
+!renders/final/.gitkeep
+renders/work/*
+!renders/work/.gitkeep

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: midi-render-pipeline
+Version: 0.3.0
+Summary: A lightweight MIDI-to-audio rendering pipeline built around sfizz_render.
+Requires-Python: >=3.11
+Requires-Dist: mido>=1.3
+Requires-Dist: numpy>=1.24
+Requires-Dist: soundfile>=0.12
+Requires-Dist: pysfizz>=0.1.3
