@@ -100,8 +100,9 @@ Rendering coverage is now resolved in this order:
 exact dedicated SFZ -> family/shared SFZ -> MuseScore General SF2
 ```
 
-Install/keep `fluidsynth` available on `PATH` and keep
-`MuseScore_General_Full.sf2` under `resources/instruments/`. The registry keeps
+Install/keep the FluidSynth shared library (`libfluidsynth`) available to the
+dynamic loader and keep `MuseScore_General_Full.sf2` under
+`resources/instruments/`. The registry keeps
 the original GM Program Change when the resolver trusts it. For stale or absent
 Program Change data, `[general_midi_fallback.program_for_instrument]` supplies a
 representative program, e.g. `synth_pad = 89`.
@@ -119,8 +120,8 @@ Run:
 midi-render doctor
 ```
 
-to check `sfizz_render`, `fluidsynth`, the MuseScore SoundFont, and all configured
-dedicated/family sources.
+to check `sfizz_render`, `libfluidsynth`, the MuseScore SoundFont, and all
+configured dedicated/family sources.
 
 ## v0.3.8 melody patch-first fallback
 
@@ -195,3 +196,37 @@ Constant-like tracks keep the v0.3.11 rule and are still canonicalized directly
 to `velocity_nominal`. `max_expand_ratio` is no longer used; old config files may
 leave that key in place harmlessly. The performance cache fingerprint is bumped
 so stems rendered with the v0.3.11 mapping are not reused accidentally.
+
+## v0.3.13 embedded multi-output FluidSynth
+
+The GM fallback no longer launches one `fluidsynth` CLI process per track. The
+Python renderer now loads `libfluidsynth` directly through a small project-local
+`ctypes` binding. One SoundFont-backed synth is kept for the normal GM batch and
+up to 16 one-channel fallback stems are rendered together. Each stem receives an
+independent FluidSynth audio group and effects group, preserving the previous
+per-track default reverb/chorus behavior without cross-stem bleed.
+
+`--jobs` now controls FluidSynth's internal `synth.cpu-cores` setting for the GM
+backend instead of the number of GM subprocesses. Tracks that themselves contain
+multiple MIDI channels use the embedded FluidSynth file-renderer compatibility
+path so their channel/controller semantics are not collapsed. The `tool =
+"fluidsynth"` key under `[general_midi_fallback]` is removed; install the shared
+library instead. `FLUIDSYNTH_LIBRARY` may point at a non-standard library path.
+
+## v0.3.14 FluidSynth fast-path correction
+
+The embedded FluidSynth backend keeps the v0.3.13 multi-output design, but no
+longer sends singleton GM work through the Python `fluid_synth_process()` loop.
+A single simple GM stem now uses FluidSynth's native file renderer directly, the
+same native offline rendering path already used for multi-channel compatibility
+stems. Multi-output rendering is reserved for batches containing at least two
+stems. Batches larger than 16 are chunked without leaving a singleton tail.
+
+The GM backend also stops mapping CLI `--jobs` to FluidSynth's internal
+`synth.cpu-cores`: GM synthesis currently uses one core by default, because the
+internal thread synchronization can cost more than it saves for light stem
+workloads. The multi-output block size increases from 64 to 1024 frames, reducing
+Python/ctypes/audio-writer crossings while preserving per-stem audio/effects
+isolation. The raw GM cache schema is bumped again and distinguishes single-track
+native renders from full-render artifacts, so a v0.3.13 batch stem cannot mask
+the new single-track fast path.

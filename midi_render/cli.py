@@ -9,6 +9,7 @@ import shutil
 import time
 
 from .effects import process_stem_effects
+from .fluidsynth_native import fluidsynth_library_info
 from .instruments import (
     melody_render_instrument,
     resolution_warnings,
@@ -30,7 +31,6 @@ from .renderer import (
     FluidSynthJob,
     RenderJob,
     RenderedStem,
-    find_fluidsynth,
     find_sfizz_render,
     render_fluidsynth_jobs,
     render_jobs,
@@ -69,10 +69,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     gm = registry.general_midi_fallback
     if gm is not None and gm.enabled:
-        fluidsynth = find_fluidsynth(gm.tool)
+        libfluidsynth, version = fluidsynth_library_info()
+        detail = libfluidsynth or ""
+        if version:
+            detail = f"{detail} (FluidSynth {version})"
         print(
-            f"command  {'OK' if fluidsynth else 'MISSING':7s}  "
-            f"{gm.tool:12s}  {fluidsynth or ''}"
+            f"library  {'OK' if libfluidsynth else 'MISSING':7s}  "
+            f"libfluidsynth  {detail}"
         )
     return 0
 
@@ -252,20 +255,22 @@ def _gm_render_cache_tag(
     midi_path: Path,
     patch: Patch,
     *,
-    tool: str,
     synth_gain: float,
     samplerate: int,
+    render_mode: str = "full-render",
 ) -> str:
     return _render_cache_tag(
         {
-            "schema": "raw-gm-v1",
+            "schema": "raw-gm-v3",
             "midi": _midi_cache_identity(midi_path),
             "soundfont": _asset_cache_identity(patch.sfz),
             "renderer": {
-                "kind": "fluidsynth",
-                "tool": tool,
+                "kind": "libfluidsynth-fastpath",
+                "render_mode": render_mode,
                 "synth_gain": synth_gain,
                 "samplerate": samplerate,
+                "cpu_cores": 1,
+                "batch_blocksize": 1024,
             },
         }
     )
@@ -495,9 +500,9 @@ def cmd_render(args: argparse.Namespace) -> int:
             render_cache_tag = _gm_render_cache_tag(
                 midi_path,
                 patch,
-                tool=gm.tool,
                 synth_gain=gm.synth_gain,
                 samplerate=args.samplerate,
+                render_mode=("single-native" if args.track is not None else "full-render"),
             )
             stem = _raw_stem_path(
                 stems_dir,
@@ -561,7 +566,6 @@ def cmd_render(args: argparse.Namespace) -> int:
                         patch=patch,
                         split_midi=split,
                         soundfont=gm.soundfont,
-                        tool=gm.tool,
                         synth_gain=gm.synth_gain,
                         output=stem,
                     )
@@ -643,7 +647,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         print("\nRaw SFZ render: 0 job(s)")
 
     if gm_jobs:
-        print(f"\nRaw GM render:  {len(gm_jobs)} job(s), workers={args.jobs}")
+        print(f"\nRaw GM render:  {len(gm_jobs)} job(s), embedded FluidSynth")
         t0 = time.perf_counter()
         rendered.extend(
             render_fluidsynth_jobs(

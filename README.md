@@ -1,7 +1,7 @@
 # Midi Render Pipeline
 
-A small, deterministic MIDI-to-audio pipeline built around the proven
-`sfizz_render` command-line process workflow.
+A small, deterministic MIDI-to-audio pipeline with Python orchestration,
+`sfizz_render` for SFZ sampling, and embedded `libfluidsynth` for GM fallback.
 
 ## Design
 
@@ -13,7 +13,9 @@ MIDI
      -> exact dedicated SFZ
      -> family/shared SFZ fallback
      -> MuseScore General SF2 / FluidSynth fallback
-  -> parallel renderer subprocesses
+  -> renderer backends
+     -> parallel sfizz_render subprocesses for SFZ
+     -> embedded libfluidsynth multi-output batches for GM/SF2
   -> declarative per-patch effect chains
      -> project-local Guitarix LV2 via lv2apply
   -> stem gains + mix + peak normalization
@@ -40,6 +42,17 @@ through FluidSynth. A single source Program Change is preserved for the GM
 fallback. If no single Program is available, the registry may provide a
 representative GM program for the name-derived canonical instrument instead.
 
+GM stems are rendered in-process through `libfluidsynth`. A single GM stem uses
+FluidSynth's native file renderer directly. When two or more ordinary one-channel
+GM stems are present, they are grouped into batches of up to 16: each stem is
+remapped to its own MIDI channel, audio group, and effects group, so one loaded
+SoundFont can render the batch while default FluidSynth reverb/chorus remain
+isolated per stem. The batch loop uses 1024-frame blocks. FluidSynth currently
+uses one internal synthesis core; `--jobs` remains the outer SFZ scheduling knob
+and is intentionally not reused as `synth.cpu-cores`. A rare pipeline track that
+itself uses multiple MIDI channels takes the same native single-stem file-renderer
+path rather than collapsing its MIDI channel state.
+
 ## Install
 
 Python 3.11+:
@@ -65,9 +78,12 @@ Guitarix bundles under `resources/fx/lv2/`:
 - `gx_ultracab.lv2`
 
 
-The final GM fallback additionally requires `fluidsynth` on `PATH` and
-`resources/instruments/MuseScore_General_Full.sf2`. `midi-render doctor` checks
-both the SoundFont and configured FluidSynth command.
+The final GM fallback requires the FluidSynth shared library (`libfluidsynth`)
+and `resources/instruments/MuseScore_General_Full.sf2`. The pipeline calls the
+C library directly through a small built-in Python `ctypes` binding; the
+`fluidsynth` CLI executable is not used. `midi-render doctor` checks both the
+SoundFont and `libfluidsynth`. `FLUIDSYNTH_LIBRARY=/path/to/libfluidsynth.so`
+can be used when the library is installed outside the normal loader search path.
 
 `lv2apply`, `lv2ls`, and `lv2info` are provided by Lilv's command-line package.
 On Void Linux:
@@ -241,7 +257,7 @@ For this single-track path, an existing raw renderer stem under
 GM/FluidSynth routes have distinct cache names. Raw cache names also contain a
 render fingerprint covering the source MIDI, selected SFZ/SoundFont identity, and
 sampler settings (`blocksize`, `samplerate`, `quality`, `polyphony` for sfizz;
-`tool`, `synth_gain`, and `samplerate` for FluidSynth). Changing any of those
+`synth_gain` and `samplerate` for embedded FluidSynth). Changing any of those
 inputs invalidates the raw cache instead of silently reusing an incompatible stem.
 
 Patch `gain_db` and LV2 effect settings are deliberately excluded from the raw

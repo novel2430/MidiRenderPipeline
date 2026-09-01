@@ -252,7 +252,6 @@ instruments = "../instruments-gm"
 
 [general_midi_fallback]
 soundfont = "MuseScore_General_Full.sf2"
-tool = "fluidsynth"
 synth_gain = 0.2
 gain_db = 0.0
 
@@ -364,7 +363,6 @@ gain_db = 0.0
 
 [general_midi_fallback]
 soundfont = "missing.sf2"
-tool = "fluidsynth"
 synth_gain = 0.2
 gain_db = 0.0
 """.strip()
@@ -459,7 +457,6 @@ gain_db = 0.0
 
 [general_midi_fallback]
 soundfont = "MuseScore_General_Full.sf2"
-tool = "fluidsynth"
 synth_gain = 0.2
 gain_db = 0.0
 
@@ -694,35 +691,31 @@ def test_gm_raw_cache_tag_tracks_soundfont_and_fluidsynth_settings(tmp_path: Pat
     baseline = cli._gm_render_cache_tag(
         midi_path,
         patch_a,
-        tool="fluidsynth",
         synth_gain=0.2,
         samplerate=48_000,
     )
     assert cli._gm_render_cache_tag(
         midi_path,
         patch_b,
-        tool="fluidsynth",
         synth_gain=0.2,
         samplerate=48_000,
     ) != baseline
     assert cli._gm_render_cache_tag(
         midi_path,
         patch_a,
-        tool="fluidsynth",
         synth_gain=0.3,
         samplerate=48_000,
     ) != baseline
     assert cli._gm_render_cache_tag(
         midi_path,
         patch_a,
-        tool="other-fluidsynth",
         synth_gain=0.2,
-        samplerate=48_000,
+        samplerate=44_100,
     ) != baseline
     assert cli._gm_render_cache_tag(
         midi_path,
         patch_a,
-        tool="fluidsynth",
         synth_gain=0.2,
-        samplerate=44_100,
+        samplerate=48_000,
+        render_mode="single-native",
     ) != baseline

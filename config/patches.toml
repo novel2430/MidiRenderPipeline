@@ -341,7 +341,6 @@ muted_trumpet = "trumpet"
 [general_midi_fallback]
 enabled = true
 soundfont = "MuseScore_General_Full.sf2"
-tool = "fluidsynth"
 synth_gain = 0.2
 gain_db = 6.0
 

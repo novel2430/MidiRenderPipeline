@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midi-render-pipeline"
-version = "0.3.12"
-description = "A lightweight MIDI-to-audio rendering pipeline built around sfizz_render."
+version = "0.3.14"
+description = "A lightweight MIDI-to-audio rendering pipeline with SFZ and embedded FluidSynth backends."
 requires-python = ">=3.11"
 dependencies = [
   "mido>=1.3",

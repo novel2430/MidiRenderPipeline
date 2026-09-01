@@ -66,7 +66,6 @@ class PerformanceProfile:
 @dataclass(frozen=True)
 class GeneralMidiFallback:
     soundfont: Path
-    tool: str = "fluidsynth"
     synth_gain: float = 0.2
     gain_db: float = 0.0
     enabled: bool = True
@@ -220,7 +219,6 @@ class PatchRegistry:
                 programs[str(instrument)] = value
             self.general_midi_fallback = GeneralMidiFallback(
                 soundfont=soundfont.resolve(),
-                tool=str(gm_cfg.get("tool", "fluidsynth")),
                 synth_gain=float(gm_cfg.get("synth_gain", 0.2)),
                 gain_db=float(gm_cfg.get("gain_db", 0.0)),
                 enabled=bool(gm_cfg.get("enabled", True)),
