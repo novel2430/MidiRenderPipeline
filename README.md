@@ -128,22 +128,25 @@ midi-render render song.mid
 ```
 
 By default `Melody` is excluded. When `--include-melody` is used, its rendering
-source is controlled by `[melody]` in `config/patches.toml`:
+source is controlled by `[melody]` in `config/patches.toml`. The current shipped
+config pins Melody to GM program 71 for stable comparison renders:
+
+```toml
+[melody]
+mode = "gm"
+gm_program = 71
+```
+
+To let each Melody track's own GM Program choose among installed dedicated,
+family, and GM sources, switch to `auto`:
 
 ```toml
 [melody]
 mode = "auto"
 ```
 
-`auto` uses the Melody track's GM Program as a timbre hint, preferring an
-installed dedicated/family patch before GM fallback. For clean A/B comparisons,
-force MuseScore GM directly:
-
-```toml
-[melody]
-mode = "gm"
-# gm_program = 73  # optional; omit to preserve the source Program when present
-```
+In `gm` mode, omit `gm_program` to preserve a trustworthy source Program when
+present, or set it explicitly to force a stable MuseScore GM timbre.
 
 Or force one canonical instrument regardless of the source Program:
 
@@ -198,13 +201,16 @@ The registry prefers the dedicated sources already present in
 - GM 27 Clean Guitar -> the configured `electric_guitar_clean` baked source
 - GM 29 Overdriven Guitar -> FSBS Distorted #1
 - GM 30 Distortion Guitar -> FSBS Distorted #2
-- bass -> Growlybass + GxSVT
+- bass -> Fashionbass + GxSVT
 - drums -> SM Drums, with optional Muldjord kick reinforcement
 - orchestral strings / brass / core woodwinds / choir / harp / timpani / vibraphone -> VPO
 
-VPO patches intentionally use simple sustain/pizzicato/tremolo/open/hit programs
-rather than keyswitch/mod-wheel programs because the input corpus is not authored
-for VPO-specific articulation control.
+VPO uses simple sustain/pizzicato/tremolo/open/hit programs where appropriate,
+while string ensemble, cello, flute, and clarinet currently use the
+`normal-mod-wheel` variants. The pipeline preserves controller events already in
+the source MIDI but does not synthesize CC1/mod-wheel automation, so those patches
+use source CC1 when present and otherwise fall back to the SFZ's default controller
+state.
 
 `[family_fallbacks]` intentionally allows several GM instruments to share a good
 dedicated source. The starter policy maps muted/harmonics guitar to the clean
@@ -232,14 +238,21 @@ midi-render render song.mid --track 6
 
 For this single-track path, an existing raw renderer stem under
 `renders/work/<song>/stems/` is reused automatically. Exact SFZ, family SFZ, and
-GM/FluidSynth routes have distinct cache names. The current effect chain is always
-run again, so changing LV2 parameters in `patches.toml` does not trigger another
-raw render pass. The default
+GM/FluidSynth routes have distinct cache names. Raw cache names also contain a
+render fingerprint covering the source MIDI, selected SFZ/SoundFont identity, and
+sampler settings (`blocksize`, `samplerate`, `quality`, `polyphony` for sfizz;
+`tool`, `synth_gain`, and `samplerate` for FluidSynth). Changing any of those
+inputs invalidates the raw cache instead of silently reusing an incompatible stem.
+
+Patch `gain_db` and LV2 effect settings are deliberately excluded from the raw
+fingerprint. The current effect chain is always run again, so tone/mix tuning does
+not trigger another sampler pass. The default
 single-track output is `renders/final/<song>.track-06.wav` and does not overwrite the
 full-song mix.
 
 If the raw stem does not exist yet, the selected track is rendered with `sfizz_render`
-once and then cached for later tuning runs.
+once and then cached for later tuning runs. Cache files created before the render
+fingerprint was introduced are intentionally not reused.
 
 ## Master output
 
@@ -248,7 +261,7 @@ Full-song renders use the single master configuration in `config/patches.toml`:
 ```toml
 [master]
 normalize_peak_db = -1.0
-gain_db = 0.0
+gain_db = -10.0
 ```
 
 The mixer first peak-normalizes to `normalize_peak_db`, then applies `gain_db`.
@@ -271,8 +284,8 @@ low_percentile = 0.10
 high_percentile = 0.90
 [performance.instruments.electric_bass]
 velocity_min = 50
-velocity_nominal = 72
-velocity_max = 85
+velocity_nominal = 60
+velocity_max = 65
 ```
 
 For a constant-like track, all positive note-on velocities are rewritten to the

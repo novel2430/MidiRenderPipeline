@@ -66,12 +66,43 @@ def _args(midi: Path, config: Path, work_dir: Path) -> Namespace:
     )
 
 
+def _sfz_cached_path(
+    midi: Path,
+    config: Path,
+    work_dir: Path,
+    instrument: str,
+    *,
+    track_index: int = 1,
+) -> Path:
+    args = _args(midi, config, work_dir)
+    registry = cli.PatchRegistry(config)
+    patch, route = registry.resolve_dedicated(instrument)
+    assert patch is not None
+    assert route is not None
+    tag = cli._sfz_render_cache_tag(
+        midi,
+        patch,
+        blocksize=args.blocksize,
+        samplerate=args.samplerate,
+        quality=args.quality,
+        polyphony=args.polyphony,
+    )
+    return cli._raw_stem_path(
+        work_dir / "stems",
+        track_index,
+        instrument,
+        route,
+        patch,
+        tag,
+    )
+
+
 def test_single_track_render_reuses_cached_raw_and_reapplies_effects(monkeypatch, tmp_path: Path):
     midi = tmp_path / "song.mid"
     _make_drive_midi(midi)
     config = _make_config(tmp_path)
     work_dir = tmp_path / "work"
-    raw = work_dir / "stems" / "track-01.electric_guitar_overdrive.raw.wav"
+    raw = _sfz_cached_path(midi, config, work_dir, "electric_guitar_overdrive")
     raw.parent.mkdir(parents=True)
     sf.write(raw, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
 
@@ -175,8 +206,21 @@ def test_single_drum_track_reuses_main_and_kick_cache_and_exports_submix(monkeyp
     work_dir = tmp_path / "work"
     stems = work_dir / "stems"
     stems.mkdir(parents=True)
-    main_raw = stems / "track-01.drums.raw.wav"
-    kick_raw = stems / "track-01.drums.kick-layer.raw.wav"
+    main_raw = _sfz_cached_path(midi, config, work_dir, "drums")
+    args = _args(midi, config, work_dir)
+    registry = cli.PatchRegistry(config)
+    kick_patch = cli._drum_kick_patch(registry)
+    assert kick_patch is not None
+    kick_tag = cli._sfz_render_cache_tag(
+        midi,
+        kick_patch,
+        blocksize=args.blocksize,
+        samplerate=args.samplerate,
+        quality=args.quality,
+        polyphony=args.polyphony,
+        midi_transform={"kind": "note-filter", "notes": [35, 36]},
+    )
+    kick_raw = stems / f"track-01.drums.kick-layer.render-{kick_tag}.raw.wav"
     sf.write(main_raw, np.ones((64, 2), dtype=np.float32) * 0.2, 48_000, subtype="FLOAT")
     sf.write(kick_raw, np.ones((64, 2), dtype=np.float32) * 0.2, 48_000, subtype="FLOAT")
 
@@ -551,21 +595,134 @@ def test_performance_profile_changes_raw_cache_key(tmp_path: Path):
     track = mido.MidiTrack()
     track.append(mido.Message("note_on", channel=0, note=45, velocity=100, time=0))
     track.append(mido.Message("note_off", channel=0, note=45, velocity=0, time=120))
-    patch = Patch("electric_bass", "test", tmp_path / "bass.sfz")
+    sfz_path = tmp_path / "bass.sfz"
+    sfz_path.write_text("// bass\n")
+    midi_path = tmp_path / "song.mid"
+    midi = mido.MidiFile(type=1)
+    midi.tracks.append(track)
+    midi.save(midi_path)
+    patch = Patch("electric_bass", "test", sfz_path)
 
     plan_a = build_velocity_plan(track, PerformanceProfile("electric_bass", 50, 72, 85))
     plan_b = build_velocity_plan(track, PerformanceProfile("electric_bass", 50, 68, 85))
     assert plan_a is not None
     assert plan_b is not None
 
-    plain = cli._raw_stem_path(tmp_path, 4, "electric_bass", "exact", patch)
+    render_tag = cli._sfz_render_cache_tag(
+        midi_path,
+        patch,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+    )
+    plain = cli._raw_stem_path(
+        tmp_path, 4, "electric_bass", "exact", patch, render_tag
+    )
     cached_a = cli._raw_stem_path(
-        tmp_path, 4, "electric_bass", "exact", patch, performance_plan=plan_a
+        tmp_path, 4, "electric_bass", "exact", patch, render_tag,
+        performance_plan=plan_a,
     )
     cached_b = cli._raw_stem_path(
-        tmp_path, 4, "electric_bass", "exact", patch, performance_plan=plan_b
+        tmp_path, 4, "electric_bass", "exact", patch, render_tag,
+        performance_plan=plan_b,
     )
 
-    assert plain.name == "track-04.electric_bass.raw.wav"
+    assert f".render-{render_tag}.raw.wav" in plain.name
     assert ".perf-" in cached_a.name
     assert cached_a != cached_b
+
+
+def test_sfz_raw_cache_tag_tracks_asset_renderer_and_midi_inputs(tmp_path: Path):
+    from midi_render.patches import Patch
+
+    midi_path = tmp_path / "song.mid"
+    _make_drive_midi(midi_path)
+    sfz_a = tmp_path / "a.sfz"
+    sfz_b = tmp_path / "b.sfz"
+    sfz_a.write_text("// a\n")
+    sfz_b.write_text("// b\n")
+    patch_a = Patch("guitar", "test", sfz_a, gain_db=-3.0, effects=("fx-a",))
+    patch_a_mix_change = Patch("guitar", "test", sfz_a, gain_db=6.0, effects=("fx-b",))
+    patch_b = Patch("guitar", "test", sfz_b)
+
+    def tag(patch, *, samplerate=48_000, quality=2):
+        return cli._sfz_render_cache_tag(
+            midi_path,
+            patch,
+            blocksize=1024,
+            samplerate=samplerate,
+            quality=quality,
+            polyphony=256,
+        )
+
+    baseline = tag(patch_a)
+    assert tag(patch_a_mix_change) == baseline
+    assert tag(patch_b) != baseline
+    assert tag(patch_a, samplerate=44_100) != baseline
+    assert tag(patch_a, quality=1) != baseline
+    assert cli._sfz_render_cache_tag(
+        midi_path,
+        patch_a,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+        midi_transform={"kind": "note-filter", "notes": [36]},
+    ) != baseline
+
+    # Editing the source MIDI in place must not reuse the previous raw stem.
+    mid = mido.MidiFile(midi_path)
+    mid.tracks[1].append(mido.Message("note_on", channel=4, note=64, velocity=90, time=0))
+    mid.tracks[1].append(mido.Message("note_off", channel=4, note=64, velocity=0, time=120))
+    mid.save(midi_path)
+    assert tag(patch_a) != baseline
+
+
+def test_gm_raw_cache_tag_tracks_soundfont_and_fluidsynth_settings(tmp_path: Path):
+    from midi_render.patches import Patch
+
+    midi_path = tmp_path / "song.mid"
+    _make_drive_midi(midi_path)
+    sf2_a = tmp_path / "a.sf2"
+    sf2_b = tmp_path / "b.sf2"
+    sf2_a.write_bytes(b"sf2-a")
+    sf2_b.write_bytes(b"sf2-b")
+    patch_a = Patch("gm_fallback_p029", "<general_midi_fallback>", sf2_a)
+    patch_b = Patch("gm_fallback_p029", "<general_midi_fallback>", sf2_b)
+
+    baseline = cli._gm_render_cache_tag(
+        midi_path,
+        patch_a,
+        tool="fluidsynth",
+        synth_gain=0.2,
+        samplerate=48_000,
+    )
+    assert cli._gm_render_cache_tag(
+        midi_path,
+        patch_b,
+        tool="fluidsynth",
+        synth_gain=0.2,
+        samplerate=48_000,
+    ) != baseline
+    assert cli._gm_render_cache_tag(
+        midi_path,
+        patch_a,
+        tool="fluidsynth",
+        synth_gain=0.3,
+        samplerate=48_000,
+    ) != baseline
+    assert cli._gm_render_cache_tag(
+        midi_path,
+        patch_a,
+        tool="other-fluidsynth",
+        synth_gain=0.2,
+        samplerate=48_000,
+    ) != baseline
+    assert cli._gm_render_cache_tag(
+        midi_path,
+        patch_a,
+        tool="fluidsynth",
+        synth_gain=0.2,
+        samplerate=44_100,
+    ) != baseline

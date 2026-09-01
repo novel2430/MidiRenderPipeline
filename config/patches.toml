@@ -23,19 +23,18 @@ gm_program = 71
 
 # Performance Adapter normalizes source-MIDI velocity semantics before the
 # sampler. Constant-like tracks are canonicalized to one nominal playing
-# intensity; genuinely dynamic tracks keep their contour but are recentered and
-# robustly scaled into the instrument's safe performance range. Track loudness
-# remains the job of patch gain_db / the mixer, not raw MIDI velocity.
+# intensity. Dynamic tracks use minimal intervention: keep velocities unchanged
+# when the robust range is already safe, shift without rescaling when possible,
+# and compress only when the source range is wider than the target range. Track
+# loudness remains the job of patch gain_db / the mixer, not raw MIDI velocity.
 [performance]
 enabled = true
 constant_spread_max = 4.0
 low_percentile = 0.10
 high_percentile = 0.90
-max_expand_ratio = 1.5
 
-# First calibrated profiles are deliberately limited to the two instruments for
-# which the source corpus already showed clear cross-MIDI velocity-scale drift.
-# Add more instruments here only after their sampler operating range is audited.
+# Only explicitly calibrated instruments are adapted. Add or retune profiles
+# after auditing the corresponding sampler's useful velocity operating range.
 [performance.instruments.electric_bass]
 velocity_min = 50
 velocity_nominal = 60
@@ -191,10 +190,10 @@ sfz = "EGuitarFSBS-dist2 bridge 20220911.sfz"
 gain_db = -2.0
 effects = []
 
-# VPO patches below intentionally use simple sustain/open/hit programs rather
-# than keyswitch or mod-wheel variants. The input corpus is not authored for
-# VPO-specific articulation control, so note/velocity-only playback is the safe
-# automatic-rendering default.
+# VPO patches use simple sustain/open/hit programs where appropriate. Selected
+# long-tone instruments currently use normal-mod-wheel variants. The pipeline
+# preserves source controllers but does not synthesize CC1/mod-wheel data, so
+# those patches rely on source MIDI CC1 or the SFZ's own default controller state.
 [patches.string_ensemble]
 library = "vpo"
 sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-normal-mod-wheel-panned.sfz"
@@ -266,8 +265,8 @@ gain_db = 0.0
 effects = []
 
 # Use the VPO instruments already present before falling back to the general GM
-# SoundFont. Simple sustain/pizzicato/tremolo programs remain the automatic-safe
-# choices; no VPO-specific keyswitch or mod-wheel authoring is assumed.
+# SoundFont. No VPO-specific keyswitch or CC1 authoring is synthesized by the
+# pipeline; normal-mod-wheel patches therefore consume only source/default CC1.
 [patches.cello]
 library = "vpo"
 sfz = "Virtual-Playing-Orchestra3/Strings/cello-SOLO-normal-mod-wheel.sfz"
@@ -434,7 +433,8 @@ RT = 0.20
 ROOMSIZE = 0.7
 DRYWET = 0.1
 
-# Generic pop-clean baseline selected for the UI Standard Guitar DI source.
+# Optional pop-clean baseline retained for experiments with the UI Standard
+# Guitar DI source. The current clean-guitar patch is the baked FSBS source.
 [effects.blueamp_clean]
 backend = "lv2apply"
 tool = "lv2apply"

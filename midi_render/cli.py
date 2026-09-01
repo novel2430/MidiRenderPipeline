@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from hashlib import sha1
+import json
 from pathlib import Path
 import shutil
 import time
@@ -183,6 +185,92 @@ def _performance_cache_suffix(plan: VelocityPlan | None) -> str:
     return f".perf-{plan.cache_tag}" if plan is not None else ""
 
 
+def _asset_cache_identity(path: Path, *, hash_content: bool = False) -> dict[str, object]:
+    """Return an identity for a renderer asset without hashing big libraries.
+
+    The resolved path catches patch/SoundFont swaps. Size and nanosecond mtime
+    invalidate the cache when the asset at that path is replaced or edited.
+    Small textual SFZ entry points are additionally content-hashed; large
+    SoundFonts intentionally use the cheaper stat identity.
+    """
+    resolved = path.resolve()
+    stat = resolved.stat()
+    identity: dict[str, object] = {
+        "path": str(resolved),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    if hash_content:
+        identity["sha1"] = sha1(resolved.read_bytes()).hexdigest()
+    return identity
+
+
+def _midi_cache_identity(path: Path) -> dict[str, object]:
+    """Hash the small source MIDI so an edited file cannot reuse an old stem."""
+    resolved = path.resolve()
+    digest = sha1(resolved.read_bytes()).hexdigest()
+    return {"path": str(resolved), "sha1": digest}
+
+
+def _render_cache_tag(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return sha1(encoded.encode("utf-8")).hexdigest()[:12]
+
+
+def _sfz_render_cache_tag(
+    midi_path: Path,
+    patch: Patch,
+    *,
+    blocksize: int,
+    samplerate: int,
+    quality: int,
+    polyphony: int,
+    midi_transform: dict[str, object] | None = None,
+) -> str:
+    return _render_cache_tag(
+        {
+            "schema": "raw-sfz-v1",
+            "midi": _midi_cache_identity(midi_path),
+            "patch": {
+                "name": patch.name,
+                "library": patch.library,
+                "asset": _asset_cache_identity(patch.sfz, hash_content=True),
+            },
+            "midi_transform": midi_transform,
+            "renderer": {
+                "kind": "sfizz_render",
+                "blocksize": blocksize,
+                "samplerate": samplerate,
+                "quality": quality,
+                "polyphony": polyphony,
+            },
+        }
+    )
+
+
+def _gm_render_cache_tag(
+    midi_path: Path,
+    patch: Patch,
+    *,
+    tool: str,
+    synth_gain: float,
+    samplerate: int,
+) -> str:
+    return _render_cache_tag(
+        {
+            "schema": "raw-gm-v1",
+            "midi": _midi_cache_identity(midi_path),
+            "soundfont": _asset_cache_identity(patch.sfz),
+            "renderer": {
+                "kind": "fluidsynth",
+                "tool": tool,
+                "synth_gain": synth_gain,
+                "samplerate": samplerate,
+            },
+        }
+    )
+
+
 def _print_performance_plan(track, instrument: str, plan: VelocityPlan | None) -> None:
     if plan is None:
         return
@@ -213,12 +301,15 @@ def _raw_stem_path(
     instrument: str,
     route: str,
     patch: Patch,
+    render_cache_tag: str,
     gm_program: int | None = None,
     performance_plan: VelocityPlan | None = None,
 ) -> Path:
-    base = f"track-{track_index:02d}.{instrument}{_performance_cache_suffix(performance_plan)}"
+    base = (
+        f"track-{track_index:02d}.{instrument}"
+        f"{_performance_cache_suffix(performance_plan)}.render-{render_cache_tag}"
+    )
     if route == "exact":
-        # Preserve the pre-v0.3.7 exact-patch cache path.
         return stems_dir / f"{base}.raw.wav"
     if route == "family":
         return stems_dir / f"{base}.family-{_safe_cache_component(patch.name)}.raw.wav"
@@ -321,8 +412,17 @@ def cmd_render(args: argparse.Namespace) -> int:
         split: Path | None = None
 
         if patch is not None and route is not None:
+            render_cache_tag = _sfz_render_cache_tag(
+                midi_path,
+                patch,
+                blocksize=args.blocksize,
+                samplerate=args.samplerate,
+                quality=args.quality,
+                polyphony=args.polyphony,
+            )
             stem = _raw_stem_path(
                 stems_dir, track.index, render_instrument, route, patch,
+                render_cache_tag,
                 performance_plan=performance_plan,
             )
             route_label = route if route == "family" else "exact"
@@ -392,12 +492,20 @@ def cmd_render(args: argparse.Namespace) -> int:
             assert gm is not None and gm_program is not None
             patch = _gm_patch(registry, gm_program)
             route = "gm"
+            render_cache_tag = _gm_render_cache_tag(
+                midi_path,
+                patch,
+                tool=gm.tool,
+                synth_gain=gm.synth_gain,
+                samplerate=args.samplerate,
+            )
             stem = _raw_stem_path(
                 stems_dir,
                 track.index,
                 render_instrument,
                 route,
                 patch,
+                render_cache_tag,
                 gm_program,
                 performance_plan,
             )
@@ -464,9 +572,19 @@ def cmd_render(args: argparse.Namespace) -> int:
             if kick_patch is not None:
                 layer = registry.drum_kick_layer
                 assert layer is not None
+                kick_cache_tag = _sfz_render_cache_tag(
+                    midi_path,
+                    kick_patch,
+                    blocksize=args.blocksize,
+                    samplerate=args.samplerate,
+                    quality=args.quality,
+                    polyphony=args.polyphony,
+                    midi_transform={"kind": "note-filter", "notes": list(layer.notes)},
+                )
                 kick_stem = stems_dir / (
                     f"track-{track.index:02d}.drums.kick-layer"
-                    f"{_performance_cache_suffix(performance_plan)}.raw.wav"
+                    f"{_performance_cache_suffix(performance_plan)}"
+                    f".render-{kick_cache_tag}.raw.wav"
                 )
                 print(
                     f"    + kick layer notes={','.join(str(x) for x in layer.notes)} "

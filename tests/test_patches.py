@@ -3,16 +3,26 @@ from pathlib import Path
 from midi_render.patches import PatchRegistry
 
 
-def test_v032_registry_selects_effect_chains_and_existing_asset_families():
+def test_current_registry_selects_baked_guitars_and_existing_asset_families():
     config = Path(__file__).parents[1] / "config" / "patches.toml"
     registry = PatchRegistry(config)
 
     clean = registry.get("electric_guitar_clean")
-    drive = registry.get("electric_guitar_drive")
+    jazz = registry.get("electric_guitar_jazz")
+    overdrive = registry.get("electric_guitar_overdrive")
+    distortion = registry.get("electric_guitar_distortion")
     assert clean is not None
-    assert drive is not None
-    assert clean.effects == ("blueamp_clean", "ultracab_clean")
-    assert drive.effects == ("clubdrive", "plexi_drive", "ultracab_drive")
+    assert jazz is not None
+    assert overdrive is not None
+    assert distortion is not None
+    assert clean.effects == ()
+    assert jazz.effects == ()
+    assert overdrive.effects == ()
+    assert distortion.effects == ()
+    assert clean.sfz.name == "EGuitarFSBS-clean bridge 20260807.sfz"
+    assert jazz.sfz.name == "EGuitarFSBS-jazz bridge 20260807.sfz"
+    assert overdrive.sfz.name == "EGuitarFSBS-dist1 bridge 20220911.sfz"
+    assert distortion.sfz.name == "EGuitarFSBS-dist2 bridge 20220911.sfz"
 
     assert registry.get("string_ensemble") is not None
     assert registry.get("choir") is not None
@@ -42,9 +52,9 @@ def test_v032_registry_selects_effect_chains_and_existing_asset_families():
     assert registry.family_fallbacks["electric_guitar_muted"] == "electric_guitar_clean"
     assert registry.family_fallbacks["electric_guitar_harmonics"] == "electric_guitar_clean"
     assert registry.family_fallbacks["muted_trumpet"] == "trumpet"
-    assert registry.melody.mode == "auto"
+    assert registry.melody.mode == "gm"
     assert registry.melody.instrument is None
-    assert registry.melody.gm_program is None
+    assert registry.melody.gm_program == 71
     gm = registry.general_midi_fallback
     assert gm is not None
     assert gm.soundfont.name == "MuseScore_General_Full.sf2"
@@ -52,31 +62,9 @@ def test_v032_registry_selects_effect_chains_and_existing_asset_families():
     assert gm.representative_program("synth_pad") == 89
 
 
-def test_v032_effect_baselines_use_lv2apply_uris():
+def test_current_active_bass_effect_baseline_uses_lv2apply_uri():
     config = Path(__file__).parents[1] / "config" / "patches.toml"
     registry = PatchRegistry(config)
-
-    blueamp = registry.effect("blueamp_clean").values
-    assert blueamp["backend"] == "lv2apply"
-    assert blueamp["bundle"] == "gx_blueamp.lv2"
-    assert blueamp["plugin_uri"] == (
-        "http://guitarix.sourceforge.net/plugins/gx_blueamp_#_blueamp_"
-    )
-    assert blueamp["input_channels"] == 1
-    assert blueamp["params"] == {
-        "BYPASS": 1.0,
-        "MASTER": 0.50,
-        "TONE": 0.50,
-        "VOLUME": 0.35,
-    }
-
-    plexi = registry.effect("plexi_drive").values
-    assert plexi["backend"] == "lv2apply"
-    assert plexi["plugin_uri"].endswith("gx_plexi_#_plexi_")
-    assert plexi["params"]["PRESENSE"] == 0.20
-    assert plexi["params"]["MID"] == 0.58
-    assert registry.effect("ultracab_clean").values["input_channels"] == 2
-    assert registry.effect("ultracab_drive").values["input_channels"] == 2
 
     bass = registry.effect("gxsvt").values
     assert bass["backend"] == "lv2apply"
@@ -85,9 +73,9 @@ def test_v032_effect_baselines_use_lv2apply_uris():
     assert bass["plugin_uri"].endswith("gx_ampegsvt_#_ampegsvt_")
     assert bass["params"] == {
         "BYPASS": 1.0,
-        "BASS": 0.55,
-        "MIDDLE": 0.50,
-        "TREBLE": 0.30,
+        "BASS": 0.60,
+        "MIDDLE": 0.30,
+        "TREBLE": 0.40,
         "VOLUME": 0.20,
         "LOWSWITCH": 1,
         "MIDSWITCH": 1,
