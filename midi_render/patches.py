@@ -23,6 +23,13 @@ class EffectConfig:
 
 
 @dataclass(frozen=True)
+class EffectRendererConfig:
+    backend: str = "native-lv2"
+    tool: str = "mrp-lv2-chain"
+    block_size: int = 1024
+
+
+@dataclass(frozen=True)
 class DrumKickLayer:
     sfz: Path
     notes: tuple[int, ...] = (35, 36)
@@ -89,6 +96,24 @@ class PatchRegistry:
         self.fx_root = (base / str(paths.get("fx", "../resources/fx"))).resolve()
         self.lv2_root = (base / str(paths.get("lv2", "../resources/fx/lv2"))).resolve()
         self.tools_root = (base / str(paths.get("tools", "../resources/tools"))).resolve()
+
+        effect_renderer_cfg = self.data.get("effect_renderer", {})
+        if not isinstance(effect_renderer_cfg, dict):
+            raise ValueError("effect_renderer must be a table")
+        effect_backend = str(effect_renderer_cfg.get("backend", "native-lv2")).strip().lower()
+        if effect_backend not in {"native-lv2", "lv2apply"}:
+            raise ValueError("effect_renderer.backend must be one of: native-lv2, lv2apply")
+        effect_block_size = int(effect_renderer_cfg.get("block_size", 1024))
+        if effect_block_size < 1:
+            raise ValueError("effect_renderer.block_size must be >= 1")
+        self.effect_renderer = EffectRendererConfig(
+            backend=effect_backend,
+            tool=str(effect_renderer_cfg.get(
+                "tool",
+                "mrp-lv2-chain" if effect_backend == "native-lv2" else "lv2apply",
+            )),
+            block_size=effect_block_size,
+        )
 
         master_cfg = self.data.get("master", {})
         self.master = MasterConfig(
@@ -318,6 +343,8 @@ class PatchRegistry:
             f"melody   OK       {melody_detail}",
             f"perform  OK       enabled={self.performance_enabled} "
             f"profiles={len(self.performance_profiles)}",
+            f"fx-host  OK       backend={self.effect_renderer.backend} "
+            f"tool={self.effect_renderer.tool} block={self.effect_renderer.block_size}",
         ]
         for name, profile in sorted(self.performance_profiles.items()):
             lines.append(

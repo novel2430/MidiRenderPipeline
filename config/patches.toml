@@ -7,6 +7,14 @@ fx = "../resources/fx"
 lv2 = "../resources/fx/lv2"
 tools = "../resources/tools"
 
+# One native process handles a stem's complete LV2 chain in 1024-frame blocks.
+# Effects may still opt into backend = "lv2apply" individually as a legacy
+# compatibility path for plugins outside the supported audio/control-only host.
+[effect_renderer]
+backend = "native-lv2"
+tool = "mrp-lv2-chain"
+block_size = 1024
+
 [master]
 normalize_peak_db = -1.0
 gain_db = -10.0
@@ -395,12 +403,10 @@ ethnic = 104
 percussion = 114
 sound_fx = 120
 
-# Bass now uses the same native Lilv/lv2apply path as the guitar effects.
+# Bass and guitar effects use the project native block-based LV2 chain host.
 # GxSVT contains its own cabinet stage, so CABSWITCH stays enabled rather than
 # adding a separate UltraCab after the bass amp.
 [effects.gxsvt]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_ampegsvt.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_ampegsvt_#_ampegsvt_"
 input_channels = 1
@@ -419,8 +425,6 @@ HIGHSWITCH = 0
 CABSWITCH = 1
 
 [effects.bass_room]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_room_simulator.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_room_simulator_#_room_simulator_"
 input_channels = 1
@@ -435,8 +439,6 @@ DRYWET = 0.1
 # Optional pop-clean baseline retained for experiments with the UI Standard
 # Guitar DI source. The current clean-guitar patch is the baked FSBS source.
 [effects.blueamp_clean]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_blueamp.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_blueamp_#_blueamp_"
 input_channels = 1
@@ -449,8 +451,6 @@ VOLUME = 0.40
 
 
 [effects.ultracab_clean]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_ultracab.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_ultracab_#_ultracab_"
 input_channels = 2
@@ -467,8 +467,6 @@ TOP = 0.20
 # Generic pop/rock drive baseline. Keep the overdrive moderate; Plexi and the
 # cabinet complete the tone rather than asking the pedal to provide all gain.
 [effects.clubdrive]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_clubdrive.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_clubdrive_#_clubdrive_"
 input_channels = 1
@@ -480,8 +478,6 @@ VOLUME = 1.0
 V1 = 0.0
 
 [effects.plexi_drive]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_plexi.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_plexi_#_plexi_"
 input_channels = 1
@@ -496,8 +492,6 @@ TREBLE = 0.80
 VOLUME = 0.25
 
 [effects.ultracab_drive]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_ultracab.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_ultracab_#_ultracab_"
 input_channels = 2
@@ -512,8 +506,6 @@ SIZE = 0.55
 TOP = 0.55
 
 [effects.tube_distortion]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_TubeDistortion.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_TubeDistortion_#_TubeDistortion_"
 input_channels = 1
@@ -524,8 +516,6 @@ INPUT = 1.0
 OUTPUT = 0.50
 
 [effects.liquid_drive]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_liquiddrive.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_liquiddrive_#_liquiddrive_"
 input_channels = 1
@@ -536,8 +526,6 @@ DRIVE = 1.0
 LEVEL = -10.0
 
 [effects.guvnor_drive]
-backend = "lv2apply"
-tool = "lv2apply"
 bundle = "gx_guvnor.lv2"
 plugin_uri = "http://guitarix.sourceforge.net/plugins/gx_guvnor_#_guvnor_"
 input_channels = 1

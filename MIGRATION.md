@@ -58,18 +58,21 @@ for p in GxSVT.lv2 GxBlueAmp.lv2 GxClubDrive.lv2 GxPlexi.lv2 GxUltraCab.lv2; do
 done
 ```
 
-Install Lilv's command-line tools (`lv2apply`, `lv2ls`, `lv2info`). On Void
-Linux:
+Build the project-native LV2 chain host after installing Lilv/libsndfile
+development packages. On Void Linux:
 
 ```bash
-sudo xbps-install -S lilv
+sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel
+make native-lv2
 ```
 
-At runtime, both Bass and electric-guitar chains use `lv2apply` with
-`LV2_PATH=resources/fx/lv2` and stable LV2 plugin URIs. This avoids relying on
-Plugalyzer/JUCE bundle-path scanning and keeps discovery tied to the
-project-local Guitarix builds even if older duplicates remain under `~/.lv2`.
-GxSVT's built-in cabinet remains enabled, matching the old tested Bass tone.
+The binary is written to `resources/tools/mrp-lv2-chain`. At runtime, Bass and
+electric-guitar chains are processed in one native block-based invocation per
+stem with `LV2_PATH=resources/fx/lv2` and stable plugin URIs. Intermediate
+effect stages remain in memory instead of round-tripping through WAV files.
+`lv2apply` is no longer required by the default runtime; keep it only for the
+explicit legacy backend or the A/B benchmark helper. GxSVT's built-in cabinet
+remains enabled, matching the old tested Bass tone.
 
 ## Resolver policy update (v0.3.4)
 
@@ -230,3 +233,36 @@ Python/ctypes/audio-writer crossings while preserving per-stem audio/effects
 isolation. The raw GM cache schema is bumped again and distinguishes single-track
 native renders from full-render artifacts, so a v0.3.13 batch stem cannot mask
 the new single-track fast path.
+## v0.3.15 native LV2 chain renderer
+
+The default effect path no longer starts one `lv2apply` process per effect
+stage. `config/patches.toml` now selects a global block-based native host:
+
+```toml
+[effect_renderer]
+backend = "native-lv2"
+tool = "mrp-lv2-chain"
+block_size = 1024
+```
+
+Build it with:
+
+```bash
+make native-lv2
+```
+
+For one stem, the complete ordered LV2 chain is instantiated in a single
+process. Audio is read once in 1024-frame blocks, mono/stereo adaptation happens
+in memory between stages, and the final result is written once. The raw sampler
+cache boundary is unchanged, so changing LV2 parameters still reuses the raw
+stem and reruns only the effect chain.
+
+The production host intentionally supports the audio/control-port subset used
+by the current project-local Guitarix plugins. A custom effect can explicitly
+set `backend = "lv2apply"` (and optionally `tool = "lv2apply"`) to request the
+old stage-by-stage compatibility path. There is no silent runtime fallback.
+
+`tools/bench_mrp_lv2_chain.py` remains available for comparing the native host
+with legacy `lv2apply`. In the project benchmark, `gxsvt` improved from about
+22.4 s to 1.73 s and `gxsvt -> bass_room` from about 38.5 s to 2.81 s at block
+1024, roughly 13x faster with very small numerical differences.

@@ -8,7 +8,12 @@ from pathlib import Path
 import shutil
 import time
 
-from .effects import process_stem_effects
+from .effects import (
+    LEGACY_LV2APPLY_BACKEND,
+    NATIVE_LV2_BACKEND,
+    find_effect_renderer_tool,
+    process_stem_effects,
+)
 from .fluidsynth_native import fluidsynth_library_info
 from .instruments import (
     melody_render_instrument,
@@ -59,11 +64,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     sfizz = find_sfizz_render()
     print(f"command  {'OK' if sfizz else 'MISSING':7s}  sfizz_render  {sfizz or ''}")
 
-    needs_lv2apply = any(
-        str(cfg.get("backend", "lv2apply")).lower() == "lv2apply"
+    effect_backends = {
+        str(cfg.get("backend", registry.effect_renderer.backend)).strip().lower()
         for cfg in registry.data.get("effects", {}).values()
-    )
-    if needs_lv2apply:
+    }
+    if NATIVE_LV2_BACKEND in effect_backends:
+        native_lv2 = find_effect_renderer_tool(registry)
+        print(
+            f"command  {'OK' if native_lv2 else 'MISSING':7s}  "
+            f"mrp-lv2-chain  {native_lv2 or ''}"
+        )
+    if LEGACY_LV2APPLY_BACKEND in effect_backends:
         lv2apply = shutil.which("lv2apply")
         print(f"command  {'OK' if lv2apply else 'MISSING':7s}  lv2apply     {lv2apply or ''}")
 

@@ -17,7 +17,7 @@ MIDI
      -> parallel sfizz_render subprocesses for SFZ
      -> embedded libfluidsynth multi-output batches for GM/SF2
   -> declarative per-patch effect chains
-     -> project-local Guitarix LV2 via lv2apply
+     -> one block-based native LV2 chain process per effected stem
   -> stem gains + mix + peak normalization
   -> WAV
 ```
@@ -68,8 +68,16 @@ under `site-packages/bin/`; Midi Render Pipeline discovers that location
 automatically, so `sfizz_render` does not need to be manually symlinked into
 `PATH`.
 
-All current LV2 effects use Lilv's native `lv2apply` with project-local
-Guitarix bundles under `resources/fx/lv2/`:
+All current LV2 effects use the project-native `mrp-lv2-chain` host with
+project-local Guitarix bundles under `resources/fx/lv2/`. One effected stem
+launches one helper process for its entire ordered chain; audio is read and
+written in 1024-frame blocks and intermediate stages stay in memory instead of
+being written as temporary WAV files. The supported production scope is the
+audio/control-port style used by the current Guitarix effects. An effect may
+explicitly set `backend = "lv2apply"` as a legacy compatibility path for a
+plugin that needs host behaviour outside that scope.
+
+Current project-local bundles include:
 
 - `gx_ampegsvt.lv2`
 - `gx_blueamp.lv2`
@@ -77,6 +85,16 @@ Guitarix bundles under `resources/fx/lv2/`:
 - `gx_plexi.lv2`
 - `gx_ultracab.lv2`
 
+Build the native host after installing Lilv/libsndfile development packages.
+On Void Linux:
+
+```bash
+sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel
+make native-lv2
+```
+
+This produces `resources/tools/mrp-lv2-chain`, which is intentionally a local
+build artifact. `midi-render doctor` reports whether it can be found.
 
 The final GM fallback requires the FluidSynth shared library (`libfluidsynth`)
 and `resources/instruments/MuseScore_General_Full.sf2`. The pipeline calls the
@@ -85,14 +103,11 @@ C library directly through a small built-in Python `ctypes` binding; the
 SoundFont and `libfluidsynth`. `FLUIDSYNTH_LIBRARY=/path/to/libfluidsynth.so`
 can be used when the library is installed outside the normal loader search path.
 
-`lv2apply`, `lv2ls`, and `lv2info` are provided by Lilv's command-line package.
-On Void Linux:
+The production path does not require `lv2apply`. Lilv and libsndfile are linked
+into `mrp-lv2-chain`; `lv2apply` remains useful only for the explicit legacy
+backend and for `tools/bench_mrp_lv2_chain.py` reference benchmarks.
 
-```bash
-sudo xbps-install -S lilv
-```
-
-For project-local effects the renderer sets
+For project-local effects the native host receives
 `LV2_PATH=resources/fx/lv2` and invokes plugins by their stable LV2 URI. This
 keeps runtime discovery tied to the project-local build even when an older
 copy of the same Guitarix plugin exists under `~/.lv2`.
@@ -116,6 +131,18 @@ done
 
 Then `midi-render doctor` should report all configured effect entries as `OK`
 (the two UltraCab presets intentionally point at the same bundle).
+
+For an A/B performance or numerical comparison against legacy `lv2apply`, keep
+Lilv's CLI tools installed and run, for example:
+
+```bash
+python tools/bench_mrp_lv2_chain.py "$RAW" --effects gxsvt --repeat 3
+python tools/bench_mrp_lv2_chain.py "$RAW" --effects gxsvt bass_room --repeat 3
+```
+
+The production default is block size 1024. On the tested `gxsvt` and
+`gxsvt -> bass_room` chains this reached roughly 13x the legacy `lv2apply`
+throughput while remaining numerically very close to the reference.
 
 ## Commands
 

@@ -62,13 +62,16 @@ def test_current_registry_selects_baked_guitars_and_existing_asset_families():
     assert gm.representative_program("synth_pad") == 89
 
 
-def test_current_active_bass_effect_baseline_uses_lv2apply_uri():
+def test_current_active_bass_effect_baseline_uses_native_lv2_chain_uri():
     config = Path(__file__).parents[1] / "config" / "patches.toml"
     registry = PatchRegistry(config)
 
+    assert registry.effect_renderer.backend == "native-lv2"
+    assert registry.effect_renderer.tool == "mrp-lv2-chain"
+    assert registry.effect_renderer.block_size == 1024
     bass = registry.effect("gxsvt").values
-    assert bass["backend"] == "lv2apply"
-    assert bass["tool"] == "lv2apply"
+    assert "backend" not in bass
+    assert "tool" not in bass
     assert bass["bundle"] == "gx_ampegsvt.lv2"
     assert bass["plugin_uri"].endswith("gx_ampegsvt_#_ampegsvt_")
     assert bass["params"] == {
