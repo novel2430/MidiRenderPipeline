@@ -1,2 +1,0 @@
-[console_scripts]
-midi-render = midi_render.cli:main

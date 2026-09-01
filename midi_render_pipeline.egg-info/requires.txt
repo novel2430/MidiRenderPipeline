@@ -1,4 +1,0 @@
-mido>=1.3
-numpy>=1.24
-soundfile>=0.12
-pysfizz>=0.1.3
