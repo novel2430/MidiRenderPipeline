@@ -14,3 +14,4 @@ renders/final/*
 !renders/final/.gitkeep
 renders/work/*
 !renders/work/.gitkeep
+renders/bench-lv2/*
