@@ -58,6 +58,7 @@ class RenderedStem:
     patch: Patch
     path: Path
     render_seconds: float
+    backend_log: str = ""
 
 
 def _is_executable(path: Path) -> bool:
@@ -94,9 +95,16 @@ def require_sfizz_render() -> str:
     return str(path)
 
 
+_FLUIDSYNTH_LIBRARY_CACHE: FluidSynthLibrary | None = None
+
+
 def require_fluidsynth_library() -> FluidSynthLibrary:
+    global _FLUIDSYNTH_LIBRARY_CACHE
+    if _FLUIDSYNTH_LIBRARY_CACHE is not None:
+        return _FLUIDSYNTH_LIBRARY_CACHE
     try:
-        return FluidSynthLibrary()
+        _FLUIDSYNTH_LIBRARY_CACHE = FluidSynthLibrary()
+        return _FLUIDSYNTH_LIBRARY_CACHE
     except FluidSynthNativeError as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -122,12 +130,14 @@ def _run_job(
     ]
 
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     dt = time.perf_counter() - t0
+    diagnostic = "\n".join(x.strip() for x in (proc.stdout, proc.stderr) if x and x.strip())
     if proc.returncode != 0:
+        suffix = f": {diagnostic}" if diagnostic else ""
         raise RuntimeError(
             f"track {job.track.index} {job.track.name!r}: "
-            f"sfizz_render returned {proc.returncode}"
+            f"sfizz_render returned {proc.returncode}{suffix}"
         )
 
     return RenderedStem(
@@ -136,6 +146,7 @@ def _run_job(
         patch=job.patch,
         path=job.output,
         render_seconds=dt,
+        backend_log=diagnostic,
     )
 
 
@@ -170,10 +181,6 @@ def render_jobs(
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
-            print(
-                f"  DONE track={result.track.index:02d} "
-                f"{result.instrument:24s} {result.render_seconds:7.2f}s"
-            )
 
     results.sort(key=lambda x: x.track.index)
     return results
@@ -500,11 +507,6 @@ def render_fluidsynth_jobs(
             cpu_cores=cpu_cores,
         )
         results.append(result)
-        print(
-            f"  DONE track={result.track.index:02d} "
-            f"{result.instrument:24s} {result.render_seconds:7.2f}s "
-            "[GM native file renderer]"
-        )
     elif simple:
         batches = _chunk_simple_gm_jobs(simple)
         capacity = max(len(batch) for batch in batches)
@@ -526,13 +528,6 @@ def render_fluidsynth_jobs(
                     blocksize=GM_BATCH_BLOCKSIZE,
                 )
                 results.extend(batch_results)
-                print(
-                    f"  DONE GM batch tracks="
-                    f"{','.join(f'{x.track.index:02d}' for x in batch_results)} "
-                    f"{batch_results[0].render_seconds:7.2f}s "
-                    f"[libfluidsynth {binding.version}, groups={len(batch)}, "
-                    f"block={GM_BATCH_BLOCKSIZE}]"
-                )
 
     for job in compatibility:
         result = _render_native_file_job(
@@ -542,11 +537,6 @@ def render_fluidsynth_jobs(
             cpu_cores=cpu_cores,
         )
         results.append(result)
-        print(
-            f"  DONE track={result.track.index:02d} "
-            f"{result.instrument:24s} {result.render_seconds:7.2f}s "
-            "[GM native compatibility]"
-        )
 
     results.sort(key=lambda x: x.track.index)
     return results

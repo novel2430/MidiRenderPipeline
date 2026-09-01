@@ -1,28 +1,29 @@
 # Midi Render Pipeline
 
-A small, deterministic MIDI-to-audio pipeline with Python orchestration,
-`sfizz_render` for SFZ sampling, and embedded `libfluidsynth` for GM fallback.
+A deterministic MIDI-to-audio rendering system with Python planning/scheduling,
+`sfizz_render` for SFZ sampling, embedded `libfluidsynth` for GM fallback, and a
+project-native block LV2 host for effects. Single-song and large batch renders
+share the same coordinator.
 
 ## Design
 
 ```text
-MIDI
-  -> track analyzer
-  -> instrument resolver
-  -> patch registry (config/patches.toml)
-     -> exact dedicated SFZ
-     -> family/shared SFZ fallback
-     -> MuseScore General SF2 / FluidSynth fallback
-  -> renderer backends
-     -> parallel sfizz_render subprocesses for SFZ
-     -> embedded libfluidsynth multi-output batches for GM/SF2
-  -> declarative per-patch effect chains
-     -> one block-based native LV2 chain process per effected stem
-  -> stem gains + mix + peak normalization
+MIDI / MIDI dataset
+  -> SongPlan / StemPlan
+  -> unified RenderTask state machine
+     -> RAW / sfizz_render
+     -> RAW / embedded FluidSynth (one or many stems per physical task)
+     -> FX / native LV2 chain
+     -> MIX / export
+  -> bounded long-running RenderingCoordinator
+     -> backend-specific executor pools
+     -> global worker budget
+     -> FX backpressure
+     -> SQLite resume journal (batch mode)
   -> WAV
 ```
 
-The current pipeline deliberately assumes **one musical MIDI track = one
+The current renderer deliberately assumes **one musical MIDI track = one
 logical instrument**. This is an operational contract, not a claim about the
 MIDI standard. The analyzer warns when a track contains multiple programs or
 note channels so exceptions are visible.
@@ -42,16 +43,33 @@ through FluidSynth. A single source Program Change is preserved for the GM
 fallback. If no single Program is available, the registry may provide a
 representative GM program for the name-derived canonical instrument instead.
 
-GM stems are rendered in-process through `libfluidsynth`. A single GM stem uses
+GM stems are rendered through embedded `libfluidsynth`. A single GM stem uses
 FluidSynth's native file renderer directly. When two or more ordinary one-channel
 GM stems are present, they are grouped into batches of up to 16: each stem is
 remapped to its own MIDI channel, audio group, and effects group, so one loaded
 SoundFont can render the batch while default FluidSynth reverb/chorus remain
 isolated per stem. The batch loop uses 1024-frame blocks. FluidSynth currently
-uses one internal synthesis core; `--jobs` remains the outer SFZ scheduling knob
-and is intentionally not reused as `synth.cpu-cores`. A rare pipeline track that
+uses one internal synthesis core. In v0.4, `--jobs` is the single-file alias for
+the coordinator's **global task budget** and is intentionally not reused as
+`synth.cpu-cores`. A rare pipeline track that
 itself uses multiple MIDI channels takes the same native single-stem file-renderer
 path rather than collapsing its MIDI channel state.
+
+## Rendering system (v0.4)
+
+`midi-render render` and `midi-render batch` now use the same long-running task
+engine. Planning remains song-scoped, while execution is stem-scoped. SFZ and
+FluidSynth are both RAW-stage backends; FX is the next stem-transform stage. A
+FluidSynth physical task may cover multiple logical stems so multi-output batching
+remains an internal optimization.
+
+Batch mode keeps only a bounded number of songs active, prioritizes MIX/FX over
+new RAW work when downstream backlog grows, and journals state to SQLite for
+crash/restart operation. Fingerprinted raw sampler files are reused for interrupted
+songs, so a restart can continue from FX/mix rather than synthesize again.
+
+See [`RENDERING_SYSTEM.md`](RENDERING_SYSTEM.md) for the task/state contracts,
+backpressure semantics, and worker-pool design.
 
 ## Install
 
@@ -170,6 +188,50 @@ Render:
 midi-render render song.mid
 ```
 
+Long-running resumable dataset render:
+
+```bash
+midi-render batch /path/to/midi-set \
+  --output-dir renders/final-batch \
+  --work-root renders/work-batch \
+  --state-db renders/render-state.sqlite3 \
+  --active-songs 32 \
+  --workers 5
+```
+
+Completed outputs are skipped on restart. The resumable song identity includes the
+source MIDI contents, so editing a MIDI in place automatically creates a new job.
+Use `--retry-failed` to retry failed songs or `--force` to ignore persisted
+DONE/FAILED state. Batch outputs preserve the input directory tree below
+`--output-dir`.
+
+### Rendering logs
+
+Rendering commands use one coordinator-owned console logger. Backend processes and
+native libraries do not write progress directly to the terminal. Successful
+`sfizz_render`, FluidSynth, and LV2 diagnostics are captured and hidden by default;
+`--debug` exposes them. This also keeps headless FluidSynth ALSA/JACK/SDL warnings
+out of normal long batch runs while preserving them for diagnosis.
+
+Color is automatic on a TTY and can be controlled explicitly:
+
+```bash
+midi-render render song.mid --color always
+midi-render batch /data/midi --color never
+NO_COLOR=1 midi-render batch /data/midi
+```
+
+Three console levels are available:
+
+- default: compact task lines for a single song and a low-noise batch heartbeat;
+- `--verbose`: planning, cache, task start/done, scheduler details;
+- `--debug`: captured backend stdout/stderr in addition to verbose output.
+
+For long experiments, `--log-file path.log` mirrors human-readable console events
+without ANSI escapes and `--json-log events.jsonl` records structured events for
+post-run analysis. Batch heartbeat frequency is controlled by `--heartbeat SECONDS`
+(default 5).
+
 By default `Melody` is excluded. When `--include-melody` is used, its rendering
 source is controlled by `[melody]` in `config/patches.toml`. The current shipped
 config pins Melody to GM program 71 for stable comparison renders:
@@ -281,11 +343,14 @@ midi-render render song.mid --track 6
 
 For this single-track path, an existing raw renderer stem under
 `renders/work/<song>/stems/` is reused automatically. Exact SFZ, family SFZ, and
-GM/FluidSynth routes have distinct cache names. Raw cache names also contain a
-render fingerprint covering the source MIDI, selected SFZ/SoundFont identity, and
-sampler settings (`blocksize`, `samplerate`, `quality`, `polyphony` for sfizz;
-`synth_gain` and `samplerate` for embedded FluidSynth). Changing any of those
-inputs invalidates the raw cache instead of silently reusing an incompatible stem.
+GM/FluidSynth routes have distinct cache names. Raw cache fingerprints are based
+on the **actual prepared MIDI bytes handed to the renderer**, plus the selected
+SFZ/SoundFont identity and renderer settings (`blocksize`, `samplerate`, `quality`,
+`polyphony` for sfizz; `synth_gain` and `samplerate` for embedded FluidSynth).
+Therefore a change to velocity adaptation, CC64/CC1 handling, note timing,
+track-splitting, note filtering, or program remapping invalidates the raw cache
+whenever it changes the renderer input, without requiring a separate transform
+version bump.
 
 Patch `gain_db` and LV2 effect settings are deliberately excluded from the raw
 fingerprint. The current effect chain is always run again, so tone/mix tuning does
@@ -294,8 +359,10 @@ single-track output is `renders/final/<song>.track-06.wav` and does not overwrit
 full-song mix.
 
 If the raw stem does not exist yet, the selected track is rendered with `sfizz_render`
-once and then cached for later tuning runs. Cache files created before the render
-fingerprint was introduced are intentionally not reused.
+once and then cached for later tuning runs. Use `--rebuild-raw` to ignore matching
+raw cache files. In batch mode, combine `--force --rebuild-raw` when DONE songs
+must also be re-planned and re-synthesized. Cache files created under older raw
+cache schemas are intentionally not reused.
 
 ## Master output
 

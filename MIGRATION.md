@@ -266,3 +266,85 @@ old stage-by-stage compatibility path. There is no silent runtime fallback.
 with legacy `lv2apply`. In the project benchmark, `gxsvt` improved from about
 22.4 s to 1.73 s and `gxsvt -> bass_room` from about 38.5 s to 2.81 s at block
 1024, roughly 13x faster with very small numerical differences.
+
+
+## v0.4.0 long-running rendering system
+
+Single-file and corpus rendering now share a `RenderingCoordinator`. Planning is
+represented explicitly as `SongPlan`, `StemPlan`, and physical `RenderTask`
+objects. SFZ and FluidSynth are unified as RAW-stage backends, while LV2 is an
+FX-stage transform; FluidSynth may still pack several logical stems into one
+physical task for multi-output efficiency.
+
+New batch mode:
+
+```bash
+midi-render batch /path/to/midi-set \
+  --output-dir renders/final-batch \
+  --work-root renders/work-batch \
+  --state-db renders/render-state.sqlite3 \
+  --active-songs 32 \
+  --workers 5
+```
+
+The coordinator maintains backend-specific SFZ, FluidSynth, FX, and mixer pools
+under one global worker budget. It schedules downstream work with MIX > FX > RAW
+priority and stops admitting new raw tasks when the FX backlog reaches
+`--max-fx-backlog`. Only `--active-songs` plans are resident at a time, so very
+large datasets do not expand into millions of in-memory task objects.
+
+Batch state is journaled in SQLite/WAL. DONE songs with existing outputs are
+skipped, RUNNING/interrupted songs are re-planned and reuse matching raw-cache
+stems, and FAILED songs are retried only with `--retry-failed`. A render-run
+identity incorporates the patch config, core renderer settings, configured SFZ/
+SF2 stat identities, and native FX helper identity to avoid silently matching a
+stale DONE state after ordinary configuration/resource changes.
+
+See `RENDERING_SYSTEM.md` for the execution contract and failure semantics.
+
+
+## v0.4.1 artifact-addressed raw cache
+
+Raw SFZ/GM cache identity now hashes the final prepared MIDI bytes that are
+actually passed to the renderer. This replaces the older source-MIDI/transform
+approximation, so changes to velocity adaptation, controllers such as sustain or
+mod wheel, timing, split/filter logic, or GM program remapping invalidate raw
+stems automatically whenever the rendered symbolic input changes. The SFZ raw
+cache schema is now `raw-sfz-v2`; the GM schema is `raw-gm-v4`.
+
+Batch song identity now includes a SHA-256 of the source MIDI contents. Editing
+a MIDI in place therefore cannot reuse a stale SQLite DONE row. The rendering
+system identity is bumped to v2 for this cache contract.
+
+`--rebuild-raw` explicitly bypasses existing raw-stem files. It is separate from
+`--force`: the latter controls SQLite DONE/FAILED state. To rerender already-DONE
+batch songs all the way from the sampler stage, use both flags.
+
+
+## v0.4.2 centralized rendering logs
+
+Rendering output is now coordinator-owned instead of being printed independently by
+SFZ, FluidSynth, FX, and mixer code. Normal single-song renders show compact colored
+RAW/FX/MIX task completion; normal batch mode uses a low-noise heartbeat rather than
+printing every stem. `--verbose` exposes planning/cache/task details and `--debug`
+adds captured backend diagnostics.
+
+`sfizz_render`, `mrp-lv2-chain`, legacy `lv2apply`, and embedded FluidSynth native
+stderr are captured on successful tasks. In particular, ALSA/JACK/SDL warnings from
+headless FluidSynth workers no longer flood ordinary batch logs; they remain visible
+with `--debug` and backend failures still include diagnostic output. The old default
+`Stem gain:` block is removed from mixer output.
+
+New logging controls:
+
+```text
+--color auto|always|never
+--verbose
+--debug
+--log-file FILE
+--json-log FILE
+--heartbeat SECONDS    # batch only
+```
+
+`NO_COLOR` is respected when color mode is `auto`. The JSONL sink records structured
+rendering events suitable for long corpus runs.

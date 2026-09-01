@@ -79,8 +79,10 @@ def _sfz_cached_path(
     patch, route = registry.resolve_dedicated(instrument)
     assert patch is not None
     assert route is not None
+    mid, _ = cli.analyze_midi(midi)
+    prepared = cli.make_split_midi(mid, midi, track_index, work_dir / "midi")
     tag = cli._sfz_render_cache_tag(
-        midi,
+        prepared,
         patch,
         blocksize=args.blocksize,
         samplerate=args.samplerate,
@@ -97,7 +99,7 @@ def _sfz_cached_path(
     )
 
 
-def test_single_track_render_reuses_cached_raw_and_reapplies_effects(monkeypatch, tmp_path: Path):
+def test_single_track_render_reuses_cached_raw(monkeypatch, tmp_path: Path):
     midi = tmp_path / "song.mid"
     _make_drive_midi(midi)
     config = _make_config(tmp_path)
@@ -106,24 +108,12 @@ def test_single_track_render_reuses_cached_raw_and_reapplies_effects(monkeypatch
     raw.parent.mkdir(parents=True)
     sf.write(raw, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
 
-    def fail_render_jobs(*args, **kwargs):
-        raise AssertionError("cached single-track render must not call sfizz_render")
-
-    calls = []
-
-    def fake_effects(stem, registry, work):
-        calls.append((stem.track.index, stem.path, stem.patch.name))
-        out = work / "fx" / "track-01.processed.wav"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(out, np.ones((64, 2), dtype=np.float32) * 0.2, 48_000, subtype="FLOAT")
-        return out
-
-    monkeypatch.setattr(cli, "render_jobs", fail_render_jobs)
-    monkeypatch.setattr(cli, "process_stem_effects", fake_effects)
     monkeypatch.chdir(tmp_path)
 
     assert cli.cmd_render(_args(midi, config, work_dir)) == 0
-    assert calls == [(1, raw, "electric_guitar_overdrive")]
+    out = tmp_path / "renders/final/song.track-01.wav"
+    audio, _ = sf.read(out, dtype="float32", always_2d=True)
+    assert np.allclose(audio, 0.1, atol=1e-5)
     assert (tmp_path / "renders/final/song.track-01.wav").is_file()
 
 
@@ -211,23 +201,22 @@ def test_single_drum_track_reuses_main_and_kick_cache_and_exports_submix(monkeyp
     registry = cli.PatchRegistry(config)
     kick_patch = cli._drum_kick_patch(registry)
     assert kick_patch is not None
+    mid, _ = cli.analyze_midi(midi)
+    kick_midi = cli.make_note_filtered_midi(
+        mid, midi, 1, work_dir / "midi", [35, 36], "kick-layer"
+    )
     kick_tag = cli._sfz_render_cache_tag(
-        midi,
+        kick_midi,
         kick_patch,
         blocksize=args.blocksize,
         samplerate=args.samplerate,
         quality=args.quality,
         polyphony=args.polyphony,
-        midi_transform={"kind": "note-filter", "notes": [35, 36]},
     )
     kick_raw = stems / f"track-01.drums.kick-layer.render-{kick_tag}.raw.wav"
     sf.write(main_raw, np.ones((64, 2), dtype=np.float32) * 0.2, 48_000, subtype="FLOAT")
     sf.write(kick_raw, np.ones((64, 2), dtype=np.float32) * 0.2, 48_000, subtype="FLOAT")
 
-    def fail_render_jobs(*args, **kwargs):
-        raise AssertionError("cached drum audition must not call sfizz_render")
-
-    monkeypatch.setattr(cli, "render_jobs", fail_render_jobs)
     monkeypatch.chdir(tmp_path)
     args = _args(midi, config, work_dir)
 
@@ -299,19 +288,36 @@ def _fake_gm_renderer_with_capture(captured):
     return fake
 
 
+def _planned_raw_jobs(midi: Path, config: Path, work_dir: Path, *, include_melody: bool = False):
+    args = _args(midi, config, work_dir)
+    args.include_melody = include_melody
+    settings = cli._render_settings_from_args(args, active_songs=1)
+    plan = cli._build_song_plan(
+        midi,
+        registry=cli.PatchRegistry(config),
+        output=(work_dir.parent / f"{midi.stem}.wav"),
+        work_dir=work_dir,
+        settings=settings,
+        track_index=1,
+        reuse_raw=False,
+        verbose=False,
+    )
+    jobs = []
+    for task in plan.raw_tasks:
+        if task.backend == cli.Backend.FLUIDSYNTH:
+            jobs.extend(task.payload)
+        else:
+            jobs.append(task.payload)
+    return plan, jobs
+
+
 def test_conflicting_track_name_preserves_source_program_for_gm_fallback(monkeypatch, tmp_path: Path):
     midi = tmp_path / "pad.mid"
     _make_named_program_midi(midi, "Pad", 49)
     config = _make_gm_fallback_config(tmp_path)
-    captured = []
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", _fake_gm_renderer_with_capture(captured))
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-gm")
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(midi, config, tmp_path / "work-gm")
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "string_ensemble"
     assert job.patch.name == "gm_fallback_p049"
     split = mido.MidiFile(job.split_midi).tracks[-1]
@@ -322,15 +328,9 @@ def test_trusted_program_is_preserved_for_gm_fallback(monkeypatch, tmp_path: Pat
     midi = tmp_path / "lead.mid"
     _make_named_program_midi(midi, "Lead", 82)
     config = _make_gm_fallback_config(tmp_path)
-    captured = []
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", _fake_gm_renderer_with_capture(captured))
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-lead")
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(midi, config, tmp_path / "work-lead")
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "synth_lead"
     assert job.patch.name == "gm_fallback_p082"
     split = mido.MidiFile(job.split_midi).tracks[-1]
@@ -369,38 +369,11 @@ gain_db = 0.0
         + "\n"
     )
 
-    captured = []
-
-    def fake_render_jobs(jobs, **kwargs):
-        rendered = []
-        for job in jobs:
-            captured.append(job)
-            job.output.parent.mkdir(parents=True, exist_ok=True)
-            sf.write(job.output, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
-            rendered.append(
-                cli.RenderedStem(
-                    track=job.track,
-                    instrument=job.instrument,
-                    patch=job.patch,
-                    path=job.output,
-                    render_seconds=0.01,
-                )
-            )
-        return rendered
-
-    def fail_gm(*args, **kwargs):
-        raise AssertionError("dedicated melody render should not fall back to GM")
-
-    monkeypatch.setattr(cli, "render_jobs", fake_render_jobs)
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", fail_gm)
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-melody-sfz")
-    args.include_melody = True
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-sfz", include_melody=True
+    )
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "flute"
     assert job.patch.name == "flute"
 
@@ -414,16 +387,11 @@ def test_include_melody_without_program_uses_melody_gm_fallback(monkeypatch, tmp
     mid.save(midi)
 
     config = _make_gm_fallback_config(tmp_path)
-    captured = []
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", _fake_gm_renderer_with_capture(captured))
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-melody-gm")
-    args.include_melody = True
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-gm", include_melody=True
+    )
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "melody"
     assert job.patch.name == "gm_fallback_p080"
     split = mido.MidiFile(job.split_midi).tracks[-1]
@@ -474,21 +442,11 @@ def test_melody_gm_mode_bypasses_available_dedicated_patch(monkeypatch, tmp_path
     midi = tmp_path / "melody-gm.mid"
     _make_named_program_midi(midi, "Melody", 73)
     config = _make_melody_policy_config(tmp_path, 'mode = "gm"')
-    captured = []
-
-    def fail_sfz(*args, **kwargs):
-        raise AssertionError("melody gm mode must bypass dedicated SFZ patches")
-
-    monkeypatch.setattr(cli, "render_jobs", fail_sfz)
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", _fake_gm_renderer_with_capture(captured))
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-melody-force-gm")
-    args.include_melody = True
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-force-gm", include_melody=True
+    )
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "melody"
     assert job.patch.name == "gm_fallback_p073"
     split = mido.MidiFile(job.split_midi).tracks[-1]
@@ -499,17 +457,11 @@ def test_melody_gm_mode_can_force_explicit_program(monkeypatch, tmp_path: Path):
     midi = tmp_path / "melody-gm-override.mid"
     _make_named_program_midi(midi, "Melody", 80)
     config = _make_melody_policy_config(tmp_path, 'mode = "gm"\ngm_program = 22')
-    captured = []
-
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", _fake_gm_renderer_with_capture(captured))
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-melody-force-gm22")
-    args.include_melody = True
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-force-gm22", include_melody=True
+    )
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "melody"
     assert job.patch.name == "gm_fallback_p022"
     split = mido.MidiFile(job.split_midi).tracks[-1]
@@ -523,39 +475,12 @@ def test_melody_instrument_mode_forces_dedicated_instrument(monkeypatch, tmp_pat
         tmp_path,
         'mode = "instrument"\ninstrument = "flute"',
     )
-    captured = []
-
-    def fake_render_jobs(jobs, **kwargs):
-        rendered = []
-        for job in jobs:
-            captured.append(job)
-            job.output.parent.mkdir(parents=True, exist_ok=True)
-            sf.write(job.output, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
-            rendered.append(
-                cli.RenderedStem(
-                    track=job.track,
-                    instrument=job.instrument,
-                    patch=job.patch,
-                    path=job.output,
-                    render_seconds=0.01,
-                )
-            )
-        return rendered
-
-    def fail_gm(*args, **kwargs):
-        raise AssertionError("forced flute should use its available dedicated patch")
-
-    monkeypatch.setattr(cli, "render_jobs", fake_render_jobs)
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", fail_gm)
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-melody-force-flute")
-    args.include_melody = True
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    assert captured[0].instrument == "flute"
-    assert captured[0].patch.name == "flute"
+    _, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-force-flute", include_melody=True
+    )
+    assert len(jobs) == 1
+    assert jobs[0].instrument == "flute"
+    assert jobs[0].patch.name == "flute"
 
 
 def test_melody_instrument_mode_falls_back_to_target_instrument_gm(monkeypatch, tmp_path: Path):
@@ -568,17 +493,11 @@ def test_melody_instrument_mode_falls_back_to_target_instrument_gm(monkeypatch, 
     # Append a representative GM mapping for the forced instrument.
     with config.open("a") as f:
         f.write("harmonica = 22\n")
-    captured = []
-
-    monkeypatch.setattr(cli, "render_fluidsynth_jobs", _fake_gm_renderer_with_capture(captured))
-    monkeypatch.chdir(tmp_path)
-
-    args = _args(midi, config, tmp_path / "work-melody-force-harmonica")
-    args.include_melody = True
-    args.keep_work = True
-    assert cli.cmd_render(args) == 0
-    assert len(captured) == 1
-    job = captured[0]
+    _, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-force-harmonica", include_melody=True
+    )
+    assert len(jobs) == 1
+    job = jobs[0]
     assert job.instrument == "harmonica"
     assert job.patch.name == "gm_fallback_p022"
     split = mido.MidiFile(job.split_midi).tracks[-1]
@@ -605,36 +524,50 @@ def test_performance_profile_changes_raw_cache_key(tmp_path: Path):
     assert plan_a is not None
     assert plan_b is not None
 
+    prepared_plain = cli.make_split_midi(midi, midi_path, 0, tmp_path / "plain")
+    prepared_a = cli.make_split_midi(midi, midi_path, 0, tmp_path / "a", plan_a)
+    prepared_b = cli.make_split_midi(midi, midi_path, 0, tmp_path / "b", plan_b)
     render_tag = cli._sfz_render_cache_tag(
-        midi_path,
+        prepared_plain,
         patch,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
         polyphony=256,
     )
+    tag_a = cli._sfz_render_cache_tag(
+        prepared_a, patch, blocksize=1024, samplerate=48_000, quality=2, polyphony=256
+    )
+    tag_b = cli._sfz_render_cache_tag(
+        prepared_b, patch, blocksize=1024, samplerate=48_000, quality=2, polyphony=256
+    )
     plain = cli._raw_stem_path(
         tmp_path, 4, "electric_bass", "exact", patch, render_tag
     )
     cached_a = cli._raw_stem_path(
-        tmp_path, 4, "electric_bass", "exact", patch, render_tag,
+        tmp_path, 4, "electric_bass", "exact", patch, tag_a,
         performance_plan=plan_a,
     )
     cached_b = cli._raw_stem_path(
-        tmp_path, 4, "electric_bass", "exact", patch, render_tag,
+        tmp_path, 4, "electric_bass", "exact", patch, tag_b,
         performance_plan=plan_b,
     )
 
     assert f".render-{render_tag}.raw.wav" in plain.name
+    assert tag_a != tag_b
     assert ".perf-" in cached_a.name
     assert cached_a != cached_b
 
 
-def test_sfz_raw_cache_tag_tracks_asset_renderer_and_midi_inputs(tmp_path: Path):
+def test_sfz_raw_cache_tag_tracks_asset_renderer_and_prepared_midi(tmp_path: Path):
     from midi_render.patches import Patch
 
-    midi_path = tmp_path / "song.mid"
-    _make_drive_midi(midi_path)
+    source = tmp_path / "song.mid"
+    _make_drive_midi(source)
+    mid, _ = cli.analyze_midi(source)
+    prepared = cli.make_split_midi(mid, source, 1, tmp_path / "prepared-a")
+    same_bytes = tmp_path / "prepared-copy.mid"
+    same_bytes.write_bytes(prepared.read_bytes())
     sfz_a = tmp_path / "a.sfz"
     sfz_b = tmp_path / "b.sfz"
     sfz_a.write_text("// a\n")
@@ -643,9 +576,9 @@ def test_sfz_raw_cache_tag_tracks_asset_renderer_and_midi_inputs(tmp_path: Path)
     patch_a_mix_change = Patch("guitar", "test", sfz_a, gain_db=6.0, effects=("fx-b",))
     patch_b = Patch("guitar", "test", sfz_b)
 
-    def tag(patch, *, samplerate=48_000, quality=2):
+    def tag(patch, *, midi=prepared, samplerate=48_000, quality=2):
         return cli._sfz_render_cache_tag(
-            midi_path,
+            midi,
             patch,
             blocksize=1024,
             samplerate=samplerate,
@@ -658,22 +591,15 @@ def test_sfz_raw_cache_tag_tracks_asset_renderer_and_midi_inputs(tmp_path: Path)
     assert tag(patch_b) != baseline
     assert tag(patch_a, samplerate=44_100) != baseline
     assert tag(patch_a, quality=1) != baseline
-    assert cli._sfz_render_cache_tag(
-        midi_path,
-        patch_a,
-        blocksize=1024,
-        samplerate=48_000,
-        quality=2,
-        polyphony=256,
-        midi_transform={"kind": "note-filter", "notes": [36]},
-    ) != baseline
+    # Cache identity is content-addressed, not tied to a temporary work path.
+    assert tag(patch_a, midi=same_bytes) == baseline
 
-    # Editing the source MIDI in place must not reuse the previous raw stem.
-    mid = mido.MidiFile(midi_path)
-    mid.tracks[1].append(mido.Message("note_on", channel=4, note=64, velocity=90, time=0))
-    mid.tracks[1].append(mido.Message("note_off", channel=4, note=64, velocity=0, time=120))
-    mid.save(midi_path)
-    assert tag(patch_a) != baseline
+    # Changing the actual bytes handed to sfizz must invalidate the raw stem.
+    edited = mido.MidiFile(prepared)
+    edited.tracks[-1].append(mido.Message("control_change", channel=4, control=64, value=127, time=0))
+    changed = tmp_path / "prepared-changed.mid"
+    edited.save(changed)
+    assert tag(patch_a, midi=changed) != baseline
 
 
 def test_gm_raw_cache_tag_tracks_soundfont_and_fluidsynth_settings(tmp_path: Path):
@@ -719,3 +645,33 @@ def test_gm_raw_cache_tag_tracks_soundfont_and_fluidsynth_settings(tmp_path: Pat
         samplerate=48_000,
         render_mode="single-native",
     ) != baseline
+
+
+def test_prepared_midi_cache_identity_changes_for_controller_edits(tmp_path: Path):
+    source = tmp_path / "piano.mid"
+    mid = mido.MidiFile(type=1)
+    conductor = mido.MidiTrack()
+    mid.tracks.append(conductor)
+    track = mido.MidiTrack()
+    track.append(mido.Message("control_change", channel=0, control=64, value=127, time=0))
+    track.append(mido.Message("note_on", channel=0, note=60, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=60, velocity=0, time=120))
+    mid.tracks.append(track)
+    mid.save(source)
+
+    prepared_a = cli.make_split_midi(mid, source, 1, tmp_path / "a")
+    edited = mido.MidiFile(source)
+    for msg in edited.tracks[1]:
+        if msg.type == "control_change" and msg.control == 64:
+            msg.value = 0
+    prepared_b = cli.make_split_midi(edited, source, 1, tmp_path / "b")
+
+    assert cli._prepared_midi_cache_identity(prepared_a) != cli._prepared_midi_cache_identity(prepared_b)
+
+
+def test_rebuild_raw_parser_flag_is_available_for_render_and_batch():
+    parser = cli.build_parser()
+    render = parser.parse_args(["render", "song.mid", "--rebuild-raw"])
+    batch = parser.parse_args(["batch", "dataset", "--rebuild-raw"])
+    assert render.rebuild_raw is True
+    assert batch.rebuild_raw is True

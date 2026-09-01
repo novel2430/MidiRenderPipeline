@@ -116,10 +116,8 @@ def mix_stems(
     sr = next(iter(sample_rates))
     mix = np.zeros((max_frames, 2), dtype=np.float32)
 
-    print("\nStem gain:")
     for stem, audio in loaded:
         gain = db_to_gain(stem.gain_db)
-        print(f"  {stem.name:32s} {stem.gain_db:+6.2f} dB  x{gain:.4f}")
         mix += pad_to(audio, max_frames) * gain
 
     pre_peak = float(np.max(np.abs(mix))) if mix.size else 0.0

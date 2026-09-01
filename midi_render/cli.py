@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from hashlib import sha1
+from hashlib import sha1, sha256
 import json
 from pathlib import Path
 import shutil
-import time
 
 from .effects import (
     LEGACY_LV2APPLY_BACKEND,
     NATIVE_LV2_BACKEND,
     find_effect_renderer_tool,
-    process_stem_effects,
 )
 from .fluidsynth_native import fluidsynth_library_info
 from .instruments import (
@@ -30,15 +28,25 @@ from .midi import (
     make_split_midi,
     musical_tracks,
 )
-from .mixer import MixStem, export_stem, export_submix, mix_stems
 from .patches import Patch, PatchRegistry
+from .render_log import LogOptions, RenderLogger
 from .renderer import (
     FluidSynthJob,
     RenderJob,
     RenderedStem,
     find_sfizz_render,
-    render_fluidsynth_jobs,
-    render_jobs,
+)
+from .system import (
+    Backend,
+    RenderSettings,
+    RenderingCoordinator,
+    SongPlan,
+    Stage,
+    StateStore,
+    StemPlan,
+    make_song_id,
+    make_stem_id,
+    make_task,
 )
 
 
@@ -219,11 +227,16 @@ def _asset_cache_identity(path: Path, *, hash_content: bool = False) -> dict[str
     return identity
 
 
-def _midi_cache_identity(path: Path) -> dict[str, object]:
-    """Hash the small source MIDI so an edited file cannot reuse an old stem."""
-    resolved = path.resolve()
-    digest = sha1(resolved.read_bytes()).hexdigest()
-    return {"path": str(resolved), "sha1": digest}
+def _prepared_midi_cache_identity(path: Path) -> dict[str, object]:
+    """Identify the exact MIDI bytes handed to a renderer.
+
+    The prepared MIDI is the authoritative symbolic input to SFZ/FluidSynth.
+    Hashing its bytes means any future change to velocity, controller, timing,
+    split, note-filter, or program-remap logic invalidates the raw cache without
+    requiring a separate transform-version bump.
+    """
+    data = path.read_bytes()
+    return {"size": len(data), "sha256": sha256(data).hexdigest()}
 
 
 def _render_cache_tag(payload: dict[str, object]) -> str:
@@ -232,25 +245,23 @@ def _render_cache_tag(payload: dict[str, object]) -> str:
 
 
 def _sfz_render_cache_tag(
-    midi_path: Path,
+    prepared_midi: Path,
     patch: Patch,
     *,
     blocksize: int,
     samplerate: int,
     quality: int,
     polyphony: int,
-    midi_transform: dict[str, object] | None = None,
 ) -> str:
     return _render_cache_tag(
         {
-            "schema": "raw-sfz-v1",
-            "midi": _midi_cache_identity(midi_path),
+            "schema": "raw-sfz-v2",
+            "prepared_midi": _prepared_midi_cache_identity(prepared_midi),
             "patch": {
                 "name": patch.name,
                 "library": patch.library,
                 "asset": _asset_cache_identity(patch.sfz, hash_content=True),
             },
-            "midi_transform": midi_transform,
             "renderer": {
                 "kind": "sfizz_render",
                 "blocksize": blocksize,
@@ -263,7 +274,7 @@ def _sfz_render_cache_tag(
 
 
 def _gm_render_cache_tag(
-    midi_path: Path,
+    prepared_midi: Path,
     patch: Patch,
     *,
     synth_gain: float,
@@ -272,8 +283,8 @@ def _gm_render_cache_tag(
 ) -> str:
     return _render_cache_tag(
         {
-            "schema": "raw-gm-v3",
-            "midi": _midi_cache_identity(midi_path),
+            "schema": "raw-gm-v4",
+            "prepared_midi": _prepared_midi_cache_identity(prepared_midi),
             "soundfont": _asset_cache_identity(patch.sfz),
             "renderer": {
                 "kind": "libfluidsynth-fastpath",
@@ -287,29 +298,25 @@ def _gm_render_cache_tag(
     )
 
 
-def _print_performance_plan(track, instrument: str, plan: VelocityPlan | None) -> None:
+def _performance_plan_text(instrument: str, plan: VelocityPlan | None) -> str | None:
     if plan is None:
-        return
+        return None
     if plan.mode == "constant":
-        print(
-            f"    PERF {instrument:24s} constant-like "
-            f"p10={plan.source_low:.1f} med={plan.source_median:.1f} "
-            f"p90={plan.source_high:.1f} -> nominal={plan.profile.velocity_nominal}"
+        return (
+            f"PERF {instrument} constant-like p10={plan.source_low:.1f} "
+            f"med={plan.source_median:.1f} p90={plan.source_high:.1f} "
+            f"-> nominal={plan.profile.velocity_nominal}"
         )
-        return
     detail = f"mode={plan.mode}"
     if plan.mode == "shift":
         detail += f" shift={plan.shift:+.1f}"
     elif plan.mode == "compress":
         detail += f" scale={plan.scale:.3f}x shift={plan.shift:+.1f}"
-    print(
-        f"    PERF {instrument:24s} dynamic "
-        f"p10={plan.source_low:.1f} med={plan.source_median:.1f} "
-        f"p90={plan.source_high:.1f} -> "
-        f"range={plan.profile.velocity_min}..{plan.profile.velocity_max} "
-        f"{detail}"
+    return (
+        f"PERF {instrument} dynamic p10={plan.source_low:.1f} "
+        f"med={plan.source_median:.1f} p90={plan.source_high:.1f} -> "
+        f"range={plan.profile.velocity_min}..{plan.profile.velocity_max} {detail}"
     )
-
 
 def _raw_stem_path(
     stems_dir: Path,
@@ -374,18 +381,79 @@ def _render_policy(track, resolution, registry: PatchRegistry) -> tuple[str, boo
     return melody_render_instrument(track) or "melody", False, None, True
 
 
-def cmd_render(args: argparse.Namespace) -> int:
-    midi_path = args.midi.resolve()
-    registry = _registry(args.config)
-    mid, tracks = analyze_midi(midi_path)
-    selected_tracks = _select_render_tracks(tracks, args.track)
+def _render_settings_from_args(args: argparse.Namespace, *, active_songs: int = 1) -> RenderSettings:
+    workers = int(getattr(args, "workers", getattr(args, "jobs", 5)))
+    return RenderSettings(
+        workers=workers,
+        sfz_workers=getattr(args, "sfz_workers", None),
+        gm_workers=int(getattr(args, "gm_workers", 1)),
+        fx_workers=getattr(args, "fx_workers", None),
+        mix_workers=int(getattr(args, "mix_workers", 1)),
+        blocksize=int(args.blocksize),
+        samplerate=int(args.samplerate),
+        quality=int(args.quality),
+        polyphony=int(args.polyphony),
+        include_melody=bool(args.include_melody),
+        skip_unconfigured=bool(args.skip_unconfigured),
+        keep_work=bool(args.keep_work),
+        active_songs=active_songs,
+        max_fx_backlog=getattr(args, "max_fx_backlog", None),
+    ).normalized()
 
-    output = (
-        args.output.resolve()
-        if args.output
-        else _default_render_output(midi_path, args.track).resolve()
-    )
-    work_dir = args.work_dir.resolve() if args.work_dir else (Path("renders/work") / midi_path.stem).resolve()
+
+def _batch_run_identity(registry: PatchRegistry, settings: RenderSettings) -> str:
+    assets = []
+    for name, patch in sorted(registry.patches.items()):
+        if patch.sfz.exists():
+            stat = patch.sfz.stat()
+            assets.append((name, str(patch.sfz.resolve()), stat.st_size, stat.st_mtime_ns))
+    gm = registry.general_midi_fallback
+    gm_asset = None
+    if gm is not None and gm.soundfont.exists():
+        stat = gm.soundfont.stat()
+        gm_asset = (str(gm.soundfont.resolve()), stat.st_size, stat.st_mtime_ns)
+    tool = registry.tools_root / registry.effect_renderer.tool
+    tool_asset = None
+    if tool.exists():
+        stat = tool.stat()
+        tool_asset = (str(tool.resolve()), stat.st_size, stat.st_mtime_ns)
+    payload = {
+        "schema": "render-system-v2",
+        "prepared_midi_contract": "artifact-addressed-v1",
+        "config_sha1": sha1(registry.config_path.read_bytes()).hexdigest(),
+        "assets": assets,
+        "gm": gm_asset,
+        "fx_tool": tool_asset,
+        "settings": {
+            "blocksize": settings.blocksize,
+            "samplerate": settings.samplerate,
+            "quality": settings.quality,
+            "polyphony": settings.polyphony,
+            "include_melody": settings.include_melody,
+            "skip_unconfigured": settings.skip_unconfigured,
+        },
+    }
+    return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+def _build_song_plan(
+    midi_path: Path,
+    *,
+    registry: PatchRegistry,
+    output: Path,
+    work_dir: Path,
+    settings: RenderSettings,
+    track_index: int | None = None,
+    reuse_raw: bool = False,
+    verbose: bool = True,
+    run_identity: str = "",
+    logger: RenderLogger | None = None,
+) -> SongPlan:
+    midi_path = midi_path.resolve()
+    output = output.resolve()
+    work_dir = work_dir.resolve()
+    mid, tracks = analyze_midi(midi_path)
+    selected_tracks = _select_render_tracks(tracks, track_index)
     split_dir = work_dir / "midi"
     stems_dir = work_dir / "stems"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -394,23 +462,26 @@ def cmd_render(args: argparse.Namespace) -> int:
     gm_jobs: list[FluidSynthJob] = []
     cached: list[RenderedStem] = []
     skipped: list[tuple[int, str, str]] = []
+    stem_plans: list[StemPlan] = []
 
-    print(f"MIDI:   {midi_path}")
-    if args.track is not None:
-        print(f"Track:  {args.track:02d}")
-    print(f"Output: {output}")
-    print(f"Work:   {work_dir}\n")
-    print("Instrument mapping:")
+    if logger is not None and logger.verbose:
+        logger.plan_detail(f"MIDI {midi_path}")
+        if track_index is not None:
+            logger.plan_detail(f"track {track_index:02d}")
+        logger.plan_detail(f"output {output}")
+        logger.plan_detail(f"work {work_dir}")
 
     for track in selected_tracks:
         resolution = resolve_track(track)
         instrument = resolution.instrument
-        if instrument == "melody" and not args.include_melody:
-            print(f"  SKIP track={track.index:02d} {track.name!r} -> melody")
+        if instrument == "melody" and not settings.include_melody:
+            if logger is not None and logger.verbose:
+                logger.plan_detail(f"SKIP track={track.index:02d} {track.name!r} -> melody")
             continue
 
-        for warning in (*track.warnings, *resolution_warnings(track)):
-            print(f"  WARN track={track.index:02d} {track.name!r}: {warning}")
+        if logger is not None:
+            for warning in (*track.warnings, *resolution_warnings(track)):
+                logger.warning(f"track {track.index:02d} {track.name!r}: {warning}", song=midi_path)
 
         render_instrument, force_gm, gm_program_override, trust_source_program = _render_policy(
             track, resolution, registry
@@ -419,53 +490,55 @@ def cmd_render(args: argparse.Namespace) -> int:
             mid.tracks[track.index],
             registry.performance_profile(render_instrument),
         )
-        _print_performance_plan(track, render_instrument, performance_plan)
+        if logger is not None and logger.verbose:
+            perf_text = _performance_plan_text(render_instrument, performance_plan)
+            if perf_text:
+                logger.plan_detail(perf_text, track_index=track.index)
         if force_gm:
             patch, route = None, None
         else:
             patch, route = registry.resolve_dedicated(render_instrument)
         gm_program: int | None = None
-        split: Path | None = None
 
         if patch is not None and route is not None:
+            split = make_split_midi(mid, midi_path, track.index, split_dir, performance_plan)
             render_cache_tag = _sfz_render_cache_tag(
-                midi_path,
+                split,
                 patch,
-                blocksize=args.blocksize,
-                samplerate=args.samplerate,
-                quality=args.quality,
-                polyphony=args.polyphony,
+                blocksize=settings.blocksize,
+                samplerate=settings.samplerate,
+                quality=settings.quality,
+                polyphony=settings.polyphony,
             )
             stem = _raw_stem_path(
-                stems_dir, track.index, render_instrument, route, patch,
+                stems_dir,
+                track.index,
+                render_instrument,
+                route,
+                patch,
                 render_cache_tag,
                 performance_plan=performance_plan,
             )
-            route_label = route if route == "family" else "exact"
-            if instrument == render_instrument:
-                mapping = f"{instrument:28s}"
-            else:
-                mapping = f"{instrument:12s} -> {render_instrument:13s}"
-            print(
-                f"  track={track.index:02d} {track.name!r:24s} -> {mapping} "
-                f"-> {patch.name} [{route_label}]"
-            )
+            if logger is not None and logger.verbose:
+                route_label = route if route == "family" else "exact"
+                mapping = instrument if instrument == render_instrument else f"{instrument} -> {render_instrument}"
+                logger.plan_detail(
+                    f"track={track.index:02d} {track.name!r} -> {mapping} -> {patch.name} [{route_label}]"
+                )
 
-            if args.track is not None and stem.is_file():
-                cached.append(
-                    RenderedStem(
-                        track=track,
-                        instrument=render_instrument,
-                        patch=patch,
-                        path=stem,
-                        render_seconds=0.0,
-                    )
+            stem_plans.append(
+                StemPlan(
+                    stem_id=make_stem_id(track.index, render_instrument),
+                    track_index=track.index,
+                    instrument=render_instrument,
+                    raw_backend=Backend.SFZ,
+                    raw_output=stem,
+                    effects=patch.effects,
                 )
-                print(f"  REUSE raw track={track.index:02d} {stem}")
+            )
+            if reuse_raw and stem.is_file():
+                cached.append(RenderedStem(track, render_instrument, patch, stem, 0.0))
             else:
-                split = make_split_midi(
-                    mid, midi_path, track.index, split_dir, performance_plan
-                )
                 sfz_jobs.append(RenderJob(track, render_instrument, patch, split, stem))
         else:
             gm = registry.general_midi_fallback
@@ -478,11 +551,7 @@ def cmd_render(args: argparse.Namespace) -> int:
             else:
                 if gm_program_override is not None:
                     gm_program = gm_program_override
-                elif (
-                    trust_source_program
-                    and resolution.program_trusted
-                    and track.primary_program is not None
-                ):
+                elif trust_source_program and resolution.program_trusted and track.primary_program is not None:
                     gm_program = track.primary_program
                 else:
                     gm_program = gm.representative_program(gm_lookup_instrument)
@@ -491,85 +560,84 @@ def cmd_render(args: argparse.Namespace) -> int:
                         gm_program = gm.representative_program(gm_lookup_instrument)
                     if gm_program is None:
                         reason = (
-                            f"no trustworthy Program Change and no representative GM program "
+                            "no trustworthy Program Change and no representative GM program "
                             f"configured for {gm_lookup_instrument}"
                         )
 
             if reason is not None:
-                if args.skip_unconfigured:
-                    print(f"  SKIP track={track.index:02d} {track.name!r} -> {instrument} ({reason})")
+                if settings.skip_unconfigured:
+                    if logger is not None and logger.verbose:
+                        logger.plan_detail(
+                            f"SKIP track={track.index:02d} {track.name!r} -> {instrument} ({reason})"
+                        )
                     skipped.append((track.index, instrument, reason))
                     continue
-                raise SystemExit(
-                    f"FAIL: track {track.index} {track.name!r} resolved to {instrument}, but {reason}. "
-                    "Run `midi-render doctor` or use --skip-unconfigured for exploratory renders."
+                raise RuntimeError(
+                    f"track {track.index} {track.name!r} resolved to {instrument}, but {reason}"
                 )
 
             assert gm is not None and gm_program is not None
             patch = _gm_patch(registry, gm_program)
-            route = "gm"
+            preserve_source_program = (
+                gm_program_override is None
+                and trust_source_program
+                and resolution.program_trusted
+            )
+            if preserve_source_program:
+                split = make_split_midi(mid, midi_path, track.index, split_dir, performance_plan)
+            else:
+                split = make_program_override_midi(
+                    mid,
+                    midi_path,
+                    track.index,
+                    split_dir,
+                    gm_program,
+                    velocity_plan=performance_plan,
+                )
+            render_mode = "single-native" if track_index is not None else "full-render"
             render_cache_tag = _gm_render_cache_tag(
-                midi_path,
+                split,
                 patch,
                 synth_gain=gm.synth_gain,
-                samplerate=args.samplerate,
-                render_mode=("single-native" if args.track is not None else "full-render"),
+                samplerate=settings.samplerate,
+                render_mode=render_mode,
             )
             stem = _raw_stem_path(
                 stems_dir,
                 track.index,
                 render_instrument,
-                route,
+                "gm",
                 patch,
                 render_cache_tag,
                 gm_program,
                 performance_plan,
             )
-            if gm_program_override is not None:
-                program_source = "melody-config"
-            elif trust_source_program and resolution.program_trusted:
-                program_source = "source"
-            else:
-                program_source = "representative"
-            if instrument == render_instrument:
-                mapping = f"{instrument:28s}"
-            else:
-                mapping = f"{instrument:12s} -> {render_instrument:13s}"
-            print(
-                f"  track={track.index:02d} {track.name!r:24s} -> {mapping} "
-                f"-> GM program={gm_program:03d} ({program_source}) [gm]"
-            )
-
-            if args.track is not None and stem.is_file():
-                cached.append(
-                    RenderedStem(
-                        track=track,
-                        instrument=render_instrument,
-                        patch=patch,
-                        path=stem,
-                        render_seconds=0.0,
-                    )
-                )
-                print(f"  REUSE raw track={track.index:02d} {stem}")
-            else:
-                preserve_source_program = (
-                    gm_program_override is None
-                    and trust_source_program
-                    and resolution.program_trusted
-                )
-                if preserve_source_program:
-                    split = make_split_midi(
-                        mid, midi_path, track.index, split_dir, performance_plan
-                    )
+            if logger is not None and logger.verbose:
+                if gm_program_override is not None:
+                    program_source = "melody-config"
+                elif trust_source_program and resolution.program_trusted:
+                    program_source = "source"
                 else:
-                    split = make_program_override_midi(
-                        mid,
-                        midi_path,
-                        track.index,
-                        split_dir,
-                        gm_program,
-                        velocity_plan=performance_plan,
-                    )
+                    program_source = "representative"
+                mapping = instrument if instrument == render_instrument else f"{instrument} -> {render_instrument}"
+                logger.plan_detail(
+                    f"track={track.index:02d} {track.name!r} -> {mapping} -> "
+                    f"GM program={gm_program:03d} ({program_source}) [gm]"
+                )
+
+            stem_plans.append(
+                StemPlan(
+                    stem_id=make_stem_id(track.index, render_instrument),
+                    track_index=track.index,
+                    instrument=render_instrument,
+                    raw_backend=Backend.FLUIDSYNTH,
+                    raw_output=stem,
+                    effects=patch.effects,
+                )
+            )
+            if reuse_raw and stem.is_file():
+                cached.append(RenderedStem(track, render_instrument, patch, stem, 0.0))
+            else:
                 gm_jobs.append(
                     FluidSynthJob(
                         track=track,
@@ -587,142 +655,273 @@ def cmd_render(args: argparse.Namespace) -> int:
             if kick_patch is not None:
                 layer = registry.drum_kick_layer
                 assert layer is not None
-                kick_cache_tag = _sfz_render_cache_tag(
+                kick_midi = make_note_filtered_midi(
+                    mid,
                     midi_path,
+                    track.index,
+                    split_dir,
+                    layer.notes,
+                    "kick-layer",
+                    performance_plan,
+                )
+                kick_cache_tag = _sfz_render_cache_tag(
+                    kick_midi,
                     kick_patch,
-                    blocksize=args.blocksize,
-                    samplerate=args.samplerate,
-                    quality=args.quality,
-                    polyphony=args.polyphony,
-                    midi_transform={"kind": "note-filter", "notes": list(layer.notes)},
+                    blocksize=settings.blocksize,
+                    samplerate=settings.samplerate,
+                    quality=settings.quality,
+                    polyphony=settings.polyphony,
                 )
                 kick_stem = stems_dir / (
                     f"track-{track.index:02d}.drums.kick-layer"
                     f"{_performance_cache_suffix(performance_plan)}"
                     f".render-{kick_cache_tag}.raw.wav"
                 )
-                print(
-                    f"    + kick layer notes={','.join(str(x) for x in layer.notes)} "
-                    f"gain={layer.gain_db:+.2f} dB -> {kick_patch.sfz.name}"
+                if logger is not None and logger.verbose:
+                    logger.plan_detail(
+                        f"kick layer track={track.index:02d} notes={','.join(str(x) for x in layer.notes)} "
+                        f"gain={layer.gain_db:+.2f} dB -> {kick_patch.sfz.name}"
+                    )
+                stem_plans.append(
+                    StemPlan(
+                        stem_id=make_stem_id(track.index, "drums_kick_layer"),
+                        track_index=track.index,
+                        instrument="drums_kick_layer",
+                        raw_backend=Backend.SFZ,
+                        raw_output=kick_stem,
+                        effects=(),
+                    )
                 )
-                if args.track is not None and kick_stem.is_file():
-                    cached.append(
-                        RenderedStem(
-                            track=track,
-                            instrument="drums_kick_layer",
-                            patch=kick_patch,
-                            path=kick_stem,
-                            render_seconds=0.0,
-                        )
-                    )
-                    print(f"  REUSE raw kick layer track={track.index:02d} {kick_stem}")
+                if reuse_raw and kick_stem.is_file():
+                    cached.append(RenderedStem(track, "drums_kick_layer", kick_patch, kick_stem, 0.0))
                 else:
-                    kick_midi = make_note_filtered_midi(
-                        mid,
-                        midi_path,
-                        track.index,
-                        split_dir,
-                        layer.notes,
-                        "kick-layer",
-                        performance_plan,
-                    )
-                    sfz_jobs.append(
-                        RenderJob(
-                            track,
-                            "drums_kick_layer",
-                            kick_patch,
-                            kick_midi,
-                            kick_stem,
-                        )
-                    )
+                    sfz_jobs.append(RenderJob(track, "drums_kick_layer", kick_patch, kick_midi, kick_stem))
 
     if not sfz_jobs and not gm_jobs and not cached:
-        raise SystemExit("FAIL: no renderable tracks")
+        raise RuntimeError("no renderable tracks")
 
-    rendered: list[RenderedStem] = list(cached)
-    if sfz_jobs:
-        print(f"\nRaw SFZ render: {len(sfz_jobs)} job(s), workers={args.jobs}")
-        t0 = time.perf_counter()
-        rendered.extend(
-            render_jobs(
-                sfz_jobs,
-                workers=args.jobs,
-                blocksize=args.blocksize,
-                samplerate=args.samplerate,
-                quality=args.quality,
-                polyphony=args.polyphony,
-            )
-        )
-        print(f"Raw SFZ wall time: {time.perf_counter() - t0:.2f}s")
-    else:
-        print("\nRaw SFZ render: 0 job(s)")
-
+    song_id = make_song_id(midi_path, output, run_identity)
+    raw_tasks = []
+    for job in sfz_jobs:
+        stem_id = make_stem_id(job.track.index, job.instrument)
+        raw_tasks.append(make_task(song_id, Stage.RAW, Backend.SFZ, (stem_id,), job))
     if gm_jobs:
-        print(f"\nRaw GM render:  {len(gm_jobs)} job(s), embedded FluidSynth")
-        t0 = time.perf_counter()
-        rendered.extend(
-            render_fluidsynth_jobs(
-                gm_jobs,
-                workers=args.jobs,
-                samplerate=args.samplerate,
-            )
+        stem_ids = tuple(make_stem_id(job.track.index, job.instrument) for job in gm_jobs)
+        raw_tasks.append(
+            make_task(song_id, Stage.RAW, Backend.FLUIDSYNTH, stem_ids, tuple(gm_jobs))
         )
-        print(f"Raw GM wall time:  {time.perf_counter() - t0:.2f}s")
+
+    return SongPlan(
+        song_id=song_id,
+        midi_path=midi_path,
+        output=output,
+        work_dir=work_dir,
+        split_dir=split_dir,
+        config_path=registry.config_path,
+        settings=settings,
+        stems=tuple(stem_plans),
+        raw_tasks=tuple(raw_tasks),
+        cached_stems=tuple(cached),
+        skipped=tuple(skipped),
+        track_index=track_index,
+        master=registry.master,
+    )
+
+
+def _render_logger(args: argparse.Namespace, *, mode: str) -> RenderLogger:
+    verbosity = "debug" if bool(getattr(args, "debug", False)) else (
+        "verbose" if bool(getattr(args, "verbose", False)) else "normal"
+    )
+    return RenderLogger(
+        LogOptions(
+            mode=mode,
+            verbosity=verbosity,
+            color=str(getattr(args, "color", "auto")),
+            log_file=getattr(args, "log_file", None),
+            json_log=getattr(args, "json_log", None),
+            heartbeat_seconds=float(getattr(args, "heartbeat", 5.0)),
+        )
+    )
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    midi_path = args.midi.resolve()
+    registry = _registry(args.config)
+    settings = _render_settings_from_args(args, active_songs=1)
+    output = args.output.resolve() if args.output else _default_render_output(midi_path, args.track).resolve()
+    work_dir = args.work_dir.resolve() if args.work_dir else (Path("renders/work") / midi_path.stem).resolve()
+    with _render_logger(args, mode="single") as logger:
+        logger.single_header(midi_path, output, track_index=args.track)
+        plan = _build_song_plan(
+            midi_path,
+            registry=registry,
+            output=output,
+            work_dir=work_dir,
+            settings=settings,
+            track_index=args.track,
+            reuse_raw=args.track is not None and not bool(getattr(args, "rebuild_raw", False)),
+            verbose=logger.verbose,
+            logger=logger,
+        )
+        if logger.verbose:
+            logger.plan_detail(f"{len(plan.stems)} planned stem{'s' if len(plan.stems) != 1 else ''}")
+        with RenderingCoordinator(settings, logger=logger, total_songs=1) as coordinator:
+            results = coordinator.run([plan])
+        result = results[0]
+    return 0 if result.status == "DONE" else 1
+
+def _batch_output_path(root: Path, source_root: Path, midi_path: Path) -> Path:
+    if source_root.is_file():
+        relative = Path(midi_path.name)
     else:
-        print("Raw GM render:  0 job(s)")
+        relative = midi_path.relative_to(source_root)
+    return (root / relative).with_suffix(".wav")
 
-    if cached:
-        print(f"Cached raw:     {len(cached)} stem(s) reused")
 
-    rendered.sort(key=lambda x: (x.track.index, x.instrument))
-    mix_inputs: list[MixStem] = []
-    for stem in rendered:
-        final_stem = process_stem_effects(stem, registry, work_dir)
-        mix_inputs.append(
-            MixStem(
-                name=f"track-{stem.track.index:02d} {stem.instrument}",
-                path=final_stem,
-                gain_db=stem.patch.gain_db,
-            )
-        )
-
-    if args.track is not None:
-        # A selected-track render is an audition/export, not a one-stem final
-        # mix. Avoid peak normalization so tone/level changes remain audible.
-        if len(mix_inputs) == 1:
-            stats = export_stem(mix_inputs[0], output)
-        else:
-            stats = export_submix(mix_inputs, output)
-        print("\nTrack render:")
-        for component in mix_inputs:
-            print(f"  component:          {component.name:28s} {component.gain_db:+.2f} dB")
-        print(f"  peak:               {stats['peak']:.4f}")
-        print(f"  duration:           {stats['duration_seconds']:.2f}s")
-        print(f"  PASS:               {output}")
-        if cached:
-            print("  NOTE:               reused cached raw stem(s); current config was reapplied")
+def _batch_work_path(root: Path, source_root: Path, midi_path: Path) -> Path:
+    if source_root.is_file():
+        relative = Path(midi_path.stem)
     else:
-        stats = mix_stems(
-            mix_inputs,
-            output,
-            normalize_peak_db=registry.master.normalize_peak_db,
-            master_gain_db=registry.master.gain_db,
-        )
-        print("\nFinal:")
-        print(f"  pre-normalize peak: {stats['pre_peak']:.4f}")
-        print(f"  normalize target:   {stats['normalize_peak_db']:+.2f} dBFS")
-        print(f"  normalize gain:     {stats['normalize_gain']:.4f}")
-        print(f"  master gain:        {stats['master_gain_db']:+.2f} dB  x{stats['master_gain']:.4f}")
-        print(f"  final peak:         {stats['final_peak']:.4f}")
-        print(f"  RMS:                {stats['rms']:.4f}")
-        print(f"  duration:           {stats['duration_seconds']:.2f}s")
-        print(f"  PASS:               {output}")
-        if skipped:
-            print(f"  NOTE:               skipped {len(skipped)} unconfigured track(s)")
+        relative = midi_path.relative_to(source_root).with_suffix("")
+    return root / relative
 
-    if not args.keep_work:
-        shutil.rmtree(split_dir, ignore_errors=True)
-    return 0
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    source_root = args.path.resolve()
+    files = _midi_files(source_root)
+    if not files:
+        raise SystemExit(f"FAIL: no MIDI files found under {source_root}")
+
+    registry = _registry(args.config)
+    settings = _render_settings_from_args(args, active_songs=args.active_songs)
+    output_root = args.output_dir.resolve()
+    work_root = args.work_root.resolve()
+    state = StateStore(args.state_db)
+    run_identity = _batch_run_identity(registry, settings)
+    planning_failures: list[tuple[Path, str]] = []
+    skipped_done = 0
+    skipped_failed = 0
+
+    with _render_logger(args, mode="batch") as logger:
+        logger.batch_header(
+            total=len(files),
+            active_songs=settings.active_songs,
+            workers=settings.workers,
+            sfz_workers=int(settings.sfz_workers or 1),
+            gm_workers=settings.gm_workers,
+            fx_workers=int(settings.fx_workers or 1),
+            mix_workers=settings.mix_workers,
+            state_db=state.path,
+            run_identity=run_identity,
+        )
+
+        def plans():
+            nonlocal skipped_done, skipped_failed
+            for index, midi_path in enumerate(files, start=1):
+                output = _batch_output_path(output_root, source_root, midi_path)
+                work_dir = _batch_work_path(work_root, source_root, midi_path)
+                song_id = make_song_id(midi_path, output, run_identity)
+                status = state.song_status(song_id)
+                if not args.force and status == "DONE":
+                    skipped_done += 1
+                    logger.batch_skip("DONE", midi_path)
+                    continue
+                if not args.force and status == "FAILED" and not args.retry_failed:
+                    skipped_failed += 1
+                    logger.batch_skip("FAILED", midi_path)
+                    continue
+                try:
+                    if logger.verbose:
+                        logger.plan_detail(f"[{index}/{len(files)}] {midi_path}")
+                    yield _build_song_plan(
+                        midi_path,
+                        registry=registry,
+                        output=output,
+                        work_dir=work_dir,
+                        settings=settings,
+                        track_index=None,
+                        reuse_raw=not bool(args.rebuild_raw),
+                        verbose=logger.verbose,
+                        run_identity=run_identity,
+                        logger=logger,
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, KeyboardInterrupt):
+                        raise
+                    error = f"{type(exc).__name__}: {exc}"
+                    planning_failures.append((midi_path, error))
+                    state.record_failure(song_id, midi_path, output, error)
+                    logger.failure(song=midi_path, stage="plan", backend=None, message=error)
+
+        try:
+            with RenderingCoordinator(
+                settings, state=state, logger=logger, total_songs=len(files)
+            ) as coordinator:
+                results = coordinator.run(plans())
+        finally:
+            state.close()
+
+        failed = [result for result in results if result.status != "DONE"]
+        done = [result for result in results if result.status == "DONE"]
+        logger.batch_progress(
+            total=len(files),
+            done=len(done),
+            failed=len(failed) + len(planning_failures),
+            active=0,
+            pending_raw=0,
+            pending_fx=0,
+            pending_mix=0,
+            inflight=0,
+            cache_hits=getattr(coordinator, "cache_hits", 0),
+            force=True,
+        )
+        logger.batch_summary(
+            total=len(files),
+            completed_now=len(done),
+            failed_now=len(failed) + len(planning_failures),
+            skipped_done=skipped_done,
+            skipped_failed=skipped_failed,
+        )
+        for result in failed[:20]:
+            logger.failure(song=result.midi_path, stage=None, backend=None, message=result.error or "render failed")
+        for path, error in planning_failures[:20]:
+            logger.failure(song=path, stage="plan", backend=None, message=error)
+        return 1 if failed or planning_failures else 0
+
+def _add_render_engine_args(p: argparse.ArgumentParser, *, batch: bool = False) -> None:
+    # --jobs remains a compatibility alias for the global worker budget on the
+    # single-file command. Batch uses the clearer --workers spelling.
+    if batch:
+        p.add_argument("--workers", type=int, default=5, help="global concurrent task budget")
+    else:
+        p.add_argument("--jobs", type=int, default=5, help="global concurrent task budget")
+    p.add_argument("--sfz-workers", type=int, help="maximum simultaneous SFZ tasks")
+    p.add_argument("--gm-workers", type=int, default=1, help="persistent FluidSynth worker processes")
+    p.add_argument("--fx-workers", type=int, help="maximum simultaneous FX-chain tasks")
+    p.add_argument("--mix-workers", type=int, default=1, help="maximum simultaneous mix/export tasks")
+    p.add_argument("--max-fx-backlog", type=int, help="pause new raw work when queued/running FX reaches this count")
+    p.add_argument("--blocksize", type=int, default=1024)
+    p.add_argument("--samplerate", type=int, default=48_000)
+    p.add_argument("--quality", type=int, default=2)
+    p.add_argument("--polyphony", type=int, default=256)
+    p.add_argument("--include-melody", action="store_true")
+    p.add_argument("--skip-unconfigured", action="store_true")
+    p.add_argument("--keep-work", action="store_true")
+    p.add_argument(
+        "--rebuild-raw",
+        action="store_true",
+        help="ignore existing raw-stem cache files; for batch DONE songs also pass --force",
+    )
+
+
+def _add_logging_args(p: argparse.ArgumentParser, *, batch: bool = False) -> None:
+    p.add_argument("--verbose", action="store_true", help="show task/planning details")
+    p.add_argument("--debug", action="store_true", help="show captured backend diagnostics")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    p.add_argument("--log-file", type=Path, help="append a plain-text rendering log")
+    p.add_argument("--json-log", type=Path, help="append structured JSONL rendering events")
+    if batch:
+        p.add_argument("--heartbeat", type=float, default=5.0, help="batch dashboard refresh interval in seconds")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -743,30 +942,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-melody", action="store_true")
     p.set_defaults(func=cmd_scan)
 
-    p = sub.add_parser("render", help="render one MIDI file")
+    p = sub.add_parser("render", help="render one MIDI file through the rendering coordinator")
     p.add_argument("midi", type=Path)
     p.add_argument("--output", type=Path)
-    p.add_argument("--track", type=int, help="render only this MIDI track; reuse its cached raw SFZ stem when available")
+    p.add_argument("--track", type=int, help="render only this MIDI track; reuse its cached raw stem when available")
     p.add_argument("--work-dir", type=Path)
-    p.add_argument("--jobs", type=int, default=5)
-    p.add_argument("--blocksize", type=int, default=1024)
-    p.add_argument("--samplerate", type=int, default=48_000)
-    p.add_argument("--quality", type=int, default=2)
-    p.add_argument("--polyphony", type=int, default=256)
-    p.add_argument("--include-melody", action="store_true")
-    p.add_argument("--skip-unconfigured", action="store_true")
-    p.add_argument("--keep-work", action="store_true")
+    _add_render_engine_args(p, batch=False)
+    _add_logging_args(p, batch=False)
     p.set_defaults(func=cmd_render)
-    return parser
 
+    p = sub.add_parser("batch", help="long-running resumable renderer for a MIDI file or directory tree")
+    p.add_argument("path", type=Path)
+    p.add_argument("--output-dir", type=Path, default=Path("renders/final-batch"))
+    p.add_argument("--work-root", type=Path, default=Path("renders/work-batch"))
+    p.add_argument("--state-db", type=Path, default=Path("renders/render-state.sqlite3"))
+    p.add_argument("--active-songs", type=int, default=32, help="maximum planned songs resident in the scheduler")
+    p.add_argument("--retry-failed", action="store_true", help="retry songs recorded as FAILED")
+    p.add_argument("--force", action="store_true", help="ignore DONE/FAILED state and re-plan every input")
+    _add_render_engine_args(p, batch=True)
+    _add_logging_args(p, batch=True)
+    p.set_defaults(func=cmd_batch)
+    return parser
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if getattr(args, "jobs", 1) < 1:
-        parser.error("--jobs must be >= 1")
+    for attr, option in (
+        ("jobs", "--jobs"),
+        ("workers", "--workers"),
+        ("sfz_workers", "--sfz-workers"),
+        ("gm_workers", "--gm-workers"),
+        ("fx_workers", "--fx-workers"),
+        ("mix_workers", "--mix-workers"),
+        ("active_songs", "--active-songs"),
+        ("max_fx_backlog", "--max-fx-backlog"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None and value < 1:
+            parser.error(f"{option} must be >= 1")
     if getattr(args, "track", None) is not None and args.track < 0:
         parser.error("--track must be >= 0")
+    if getattr(args, "heartbeat", None) is not None and args.heartbeat <= 0:
+        parser.error("--heartbeat must be > 0")
     return int(args.func(args) or 0)
 
 

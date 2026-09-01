@@ -175,12 +175,12 @@ def test_explicit_legacy_lv2apply_backend_still_runs_stage_by_stage(monkeypatch,
 
     calls: list[tuple[list[str], dict[str, str]]] = []
 
-    def fake_run(cmd, *, env):
+    def fake_run(cmd, *, env, **kwargs):
         source = Path(cmd[cmd.index("-i") + 1])
         output = Path(cmd[cmd.index("-o") + 1])
         shutil.copyfile(source, output)
         calls.append((list(cmd), dict(env)))
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(effects.subprocess, "run", fake_run)
 

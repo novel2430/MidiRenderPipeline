@@ -111,7 +111,7 @@ def _run_lv2apply_effect(
     stage: int,
     registry: PatchRegistry,
     work_dir: Path,
-) -> Path:
+) -> tuple[Path, str]:
     """Legacy compatibility path for explicitly configured lv2apply effects."""
     cfg = registry.effect(effect_name).values
     tool = _resolve_executable(registry, str(cfg.get("tool", "lv2apply")))
@@ -151,26 +151,27 @@ def _run_lv2apply_effect(
     env["LV2_PATH"] = str(registry.lv2_root)
 
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, env=env)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     dt = time.perf_counter() - t0
+    detail = "\n".join(x.strip() for x in (proc.stdout, proc.stderr) if x and x.strip())
     if proc.returncode != 0:
-        raise RuntimeError(f"lv2apply returned {proc.returncode} for effect {effect_name}")
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"lv2apply returned {proc.returncode} for effect {effect_name}{suffix}")
     if not output.is_file():
         raise RuntimeError(f"lv2apply produced no output for effect {effect_name}: {output}")
 
-    print(f"  FX   track={stem.track.index:02d} {effect_name:18s} {dt:.2f}s")
-    return output
+    return output, detail
 
 
 def _run_native_lv2_chain(
     stem: RenderedStem,
     registry: PatchRegistry,
     work_dir: Path,
-) -> Path:
+) -> tuple[Path, str]:
     """Process one complete LV2 chain in a single block-based native helper."""
     effect_names = stem.patch.effects
     if not effect_names:
-        return stem.path
+        return stem.path, ""
 
     tool_values: list[str] = []
     stages: list[tuple[str, dict[str, object]]] = []
@@ -243,15 +244,16 @@ def _run_native_lv2_chain(
     if not output.is_file():
         raise RuntimeError(f"native LV2 chain produced no output: {output}")
 
-    chain = " -> ".join(effect_names)
-    print(f"  FX   track={stem.track.index:02d} {chain} {dt:.2f}s")
-    return output
+    detail = "\n".join(x.strip() for x in (proc.stdout, proc.stderr) if x and x.strip())
+    return output, detail
 
 
 def process_stem_effects(
     stem: RenderedStem,
     registry: PatchRegistry,
     work_dir: Path,
+    *,
+    diagnostics: list[str] | None = None,
 ) -> Path:
     if not stem.patch.effects:
         return stem.path
@@ -266,12 +268,15 @@ def process_stem_effects(
 
     backend = backends[0]
     if backend == NATIVE_LV2_BACKEND:
-        return _run_native_lv2_chain(stem, registry, work_dir)
+        path, detail = _run_native_lv2_chain(stem, registry, work_dir)
+        if diagnostics is not None and detail:
+            diagnostics.append(detail)
+        return path
 
     if backend == LEGACY_LV2APPLY_BACKEND:
         path = stem.path
         for stage, effect_name in enumerate(stem.patch.effects, start=1):
-            path = _run_lv2apply_effect(
+            path, detail = _run_lv2apply_effect(
                 stem,
                 path,
                 effect_name,
@@ -279,6 +284,8 @@ def process_stem_effects(
                 registry,
                 work_dir,
             )
+            if diagnostics is not None and detail:
+                diagnostics.append(detail)
         return path
 
     raise ValueError(f"unknown effect backend {backend!r}")
