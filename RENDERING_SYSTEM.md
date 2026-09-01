@@ -1,6 +1,6 @@
 # Rendering System
 
-MidiRenderPipeline v0.4 turns the former one-song procedural pipeline into a
+MidiRenderPipeline v0.5 uses the former one-song procedural pipeline into a
 bounded, resumable rendering system. The audio backends are still deliberately
 different internally, but they share one planning, task, scheduling, and state
 model.
@@ -53,10 +53,10 @@ them.
            +--------------------+--------------------+
            |                    |                    |
         SFZ pool             GM pool              FX pool
-     Thread workers       Process workers       Thread workers
+  resident processes     Process workers       Thread workers
            |                    |                    |
-     sfizz_render          libfluidsynth        mrp-lv2-chain
-     child process         embedded native       child process
+   one Synth / SFZ        libfluidsynth        mrp-lv2-chain
+   RAM load once          embedded native       child process
                                                     |
                                                whole LV2 chain
                                 |
@@ -65,8 +65,9 @@ them.
 
 Why the pools differ:
 
-- SFZ work is already isolated in `sfizz_render`, so lightweight Python threads
-  only supervise native child processes.
+- SFZ work uses instrument-affine resident worker processes. Each process owns
+  one Synth/SFZ, loads samples into RAM once, and executes matching tasks
+  serially. Different resident processes may render concurrently.
 - FluidSynth is embedded in Python, so GM work gets persistent process isolation.
   The worker processes are long-lived; each physical GM task still creates the
   synth/session required by the v0.3.14 native-file or multi-output fast path.
@@ -155,6 +156,7 @@ Useful controls:
 --workers N          global simultaneous task budget (batch)
 --jobs N             same global budget for single-file render compatibility
 --sfz-workers N      cap simultaneous SFZ tasks
+--sfz-resident-memory SIZE  resident SFZ RAM budget (default auto)
 --gm-workers N       cap FluidSynth worker processes
 --fx-workers N       cap native LV2-chain tasks
 --mix-workers N      cap mix/export tasks
@@ -179,14 +181,23 @@ MIDI or plugin failure into a corpus-wide abort.
 Planning failures are also persisted per song and do not stop the rest of batch
 admission.
 
-## Current warm-state boundary
+## Persistent SFZ worker boundary
 
-v0.4 establishes the long-running executor boundary first. FluidSynth worker
-processes persist across songs, but synth/SoundFont sessions are currently scoped
-to each physical GM task so the proven v0.3.14 single-stem native file-renderer
-fast path is preserved. Likewise, each FX task still launches one
-`mrp-lv2-chain` process; making Lilv discovery/plugin hosting daemon-persistent is
-an independent backend optimization and is not required by the scheduler model.
+The SFZ backend uses a `PersistentSfizzPool` keyed by the resolved SFZ asset and
+render settings. One resident entry owns one process, one Synth, and one loaded
+instrument for its lifetime. V1 allows one replica per key, so a second task for a
+busy instrument stays pending while unrelated resident instruments may still run.
+
+Execution concurrency and residency are separate controls. `--sfz-workers` limits
+running SFZ tasks; `--sfz-resident-memory` limits retained instrument memory.
+Cold-load admission reserves memory before launching a worker, actual residency is
+then measured through sfizz's 64-bit allocation API, and idle entries are evicted
+least-recently-used when necessary. The coordinator does not move a task into
+`inflight` until the pool can actually admit it.
+
+Every render starts with offline-baseline restore and seed 0. Worker crashes,
+timeouts, protocol errors, or render failures invalidate that resident entry and
+remove partial raw WAV output; there is no silent legacy-renderer fallback.
 
 
 ## Observability and console UI (v0.4.2)
@@ -211,7 +222,7 @@ shows backend diagnostics captured during successful tasks.
 
 The production backends are quiet by construction:
 
-- `sfizz_render` stdout/stderr is captured by its supervising worker;
+- persistent sfizz-worker stderr is continuously drained and retained as a bounded diagnostic tail;
 - embedded FluidSynth runs in an isolated GM worker whose native process stderr is
   captured at the file-descriptor level, including ALSA/JACK/SDL messages emitted by
   C libraries;

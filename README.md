@@ -1,9 +1,9 @@
 # Midi Render Pipeline
 
 A deterministic MIDI-to-audio rendering system with Python planning/scheduling,
-`sfizz_render` for SFZ sampling, embedded `libfluidsynth` for GM fallback, and a
-project-native block LV2 host for effects. Single-song and large batch renders
-share the same coordinator.
+persistent RAM-resident sfizz workers for SFZ sampling, embedded `libfluidsynth`
+for GM fallback, and a project-native block LV2 host for effects. Single-song
+and large batch renders share the same coordinator.
 
 ## Design
 
@@ -11,7 +11,7 @@ share the same coordinator.
 MIDI / MIDI dataset
   -> SongPlan / StemPlan
   -> unified RenderTask state machine
-     -> RAW / sfizz_render
+     -> RAW / persistent sfizz worker
      -> RAW / embedded FluidSynth (one or many stems per physical task)
      -> FX / native LV2 chain
      -> MIX / export
@@ -55,7 +55,7 @@ the coordinator's **global task budget** and is intentionally not reused as
 itself uses multiple MIDI channels takes the same native single-stem file-renderer
 path rather than collapsing its MIDI channel state.
 
-## Rendering system (v0.4)
+## Rendering system (v0.5)
 
 `midi-render render` and `midi-render batch` now use the same long-running task
 engine. Planning remains song-scoped, while execution is stem-scoped. SFZ and
@@ -81,10 +81,18 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-`pysfizz` is a project dependency. Its wheel ships the `sfizz_render` helper
-under `site-packages/bin/`; Midi Render Pipeline discovers that location
-automatically, so `sfizz_render` does not need to be manually symlinked into
-`PATH`.
+SFZ rendering uses the pinned MRP sfizz fork and the project-local
+`mrp-sfizz-worker`. Build the worker with:
+
+```bash
+make native-sfizz-worker
+```
+
+The worker dynamically loads the patched `libsfizz.so`. Point MRP at that library
+with `paths.sfizz_library` in `config/patches.toml`, or set `MRP_LIBSFIZZ`
+(`LIBSFIZZ` is also accepted). The library must expose offline render API v1 and
+the 64-bit memory-accounting extension. `midi-render doctor` checks the worker,
+library, protocol, and API before production use.
 
 All current LV2 effects use the project-native `mrp-lv2-chain` host with
 project-local Guitarix bundles under `resources/fx/lv2/`. One effected stem
@@ -109,6 +117,8 @@ On Void Linux:
 ```bash
 sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel
 make native-lv2
+# or build both project-local native helpers:
+make native
 ```
 
 This produces `resources/tools/mrp-lv2-chain`, which is intentionally a local
@@ -205,11 +215,24 @@ Use `--retry-failed` to retry failed songs or `--force` to ignore persisted
 DONE/FAILED state. Batch outputs preserve the input directory tree below
 `--output-dir`.
 
+### Persistent SFZ residency
+
+SFZ tasks use one resident process/Synth per instrument identity. A worker loads
+its SFZ and samples once, then executes matching RenderTasks serially with a fresh
+offline task baseline and deterministic seed. Different resident workers may run
+concurrently. V1 intentionally keeps at most one resident replica per instrument.
+
+`--sfz-workers` limits simultaneously executing SFZ tasks. RAM residency is a
+separate budget controlled by `--sfz-resident-memory SIZE` (for example `12GiB`);
+the default `auto` keeps an operating-system reserve. When the budget is full,
+only idle least-recently-used instrument workers are evicted. Running workers are
+never killed for admission. Worker processes live only for the current MRP run.
+
 ### Rendering logs
 
 Rendering commands use one coordinator-owned console logger. Backend processes and
 native libraries do not write progress directly to the terminal. Successful
-`sfizz_render`, FluidSynth, and LV2 diagnostics are captured and hidden by default;
+persistent sfizz-worker, FluidSynth, and LV2 diagnostics are captured and hidden by default;
 `--debug` exposes them. This also keeps headless FluidSynth ALSA/JACK/SDL warnings
 out of normal long batch runs while preserving them for diagnosis.
 
@@ -358,8 +381,10 @@ not trigger another sampler pass. The default
 single-track output is `renders/final/<song>.track-06.wav` and does not overwrite the
 full-song mix.
 
-If the raw stem does not exist yet, the selected track is rendered with `sfizz_render`
-once and then cached for later tuning runs. Use `--rebuild-raw` to ignore matching
+If the raw stem does not exist yet, the selected track is rendered by the
+instrument-affine persistent sfizz pool and then cached for later tuning runs.
+Within one MRP run, the same SFZ stays RAM-resident and is reused across songs
+until the resident-memory budget evicts its idle worker. Use `--rebuild-raw` to ignore matching
 raw cache files. In batch mode, combine `--force --rebuild-raw` when DONE songs
 must also be re-planned and re-synthesized. Cache files created under older raw
 cache schemas are intentionally not reused.

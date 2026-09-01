@@ -96,6 +96,14 @@ class PatchRegistry:
         self.fx_root = (base / str(paths.get("fx", "../resources/fx"))).resolve()
         self.lv2_root = (base / str(paths.get("lv2", "../resources/fx/lv2"))).resolve()
         self.tools_root = (base / str(paths.get("tools", "../resources/tools"))).resolve()
+        sfizz_library = paths.get("sfizz_library")
+        if sfizz_library is None:
+            self.sfizz_library: Path | None = None
+        else:
+            candidate = Path(str(sfizz_library)).expanduser()
+            if not candidate.is_absolute():
+                candidate = base / candidate
+            self.sfizz_library = candidate.resolve()
 
         effect_renderer_cfg = self.data.get("effect_renderer", {})
         if not isinstance(effect_renderer_cfg, dict):

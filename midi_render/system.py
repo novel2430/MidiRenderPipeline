@@ -24,8 +24,12 @@ from .renderer import (
     RenderJob,
     RenderedStem,
     render_fluidsynth_jobs,
-    require_sfizz_render,
-    _run_job,
+)
+from .sfizz_persistent import (
+    PersistentSfizzExecution,
+    PersistentSfizzPool,
+    PersistentSfizzStats,
+    SFIZZ_TASK_SEED,
 )
 
 
@@ -58,6 +62,9 @@ class RenderSettings:
     keep_work: bool = False
     active_songs: int = 32
     max_fx_backlog: int | None = None
+    sfz_resident_memory: int | None = None
+    sfizz_worker: Path | None = None
+    sfizz_library: Path | None = None
 
     def normalized(self) -> "RenderSettings":
         if self.workers < 1:
@@ -76,6 +83,8 @@ class RenderSettings:
             backlog = max(self.workers * 2, 4)
         if backlog < 1:
             raise ValueError("max_fx_backlog must be >= 1")
+        if self.sfz_resident_memory is not None and self.sfz_resident_memory < 1:
+            raise ValueError("sfz_resident_memory must be >= 1")
         return RenderSettings(
             workers=self.workers,
             sfz_workers=sfz,
@@ -91,6 +100,9 @@ class RenderSettings:
             keep_work=self.keep_work,
             active_songs=self.active_songs,
             max_fx_backlog=backlog,
+            sfz_resident_memory=self.sfz_resident_memory,
+            sfizz_worker=self.sfizz_worker,
+            sfizz_library=self.sfizz_library,
         )
 
 
@@ -318,16 +330,6 @@ class _Runtime:
 
 
 @dataclass(frozen=True)
-class _SFZPayload:
-    job: RenderJob
-    blocksize: int
-    samplerate: int
-    quality: int
-    polyphony: int
-    sfizz_render: str
-
-
-@dataclass(frozen=True)
 class _GMPayload:
     jobs: tuple[FluidSynthJob, ...]
     samplerate: int
@@ -376,18 +378,6 @@ def _capture_fd2(callable_):
         suffix = f"\n{diagnostics}" if diagnostics else ""
         raise RuntimeError(f"{error}{suffix}") from error
     return value, diagnostics
-
-
-def _execute_sfz(payload: _SFZPayload) -> _TaskExecution:
-    result = _run_job(
-        payload.job,
-        payload.sfizz_render,
-        payload.blocksize,
-        payload.samplerate,
-        payload.quality,
-        payload.polyphony,
-    )
-    return _TaskExecution([result], result.backend_log)
 
 
 def _execute_gm(payload: _GMPayload) -> _TaskExecution:
@@ -461,9 +451,17 @@ class RenderingCoordinator:
         self.state = state
         self.logger = logger
         self.total_songs = total_songs
-        self.sfizz_render: str | None = None
 
-        self.sfz_pool = ThreadPoolExecutor(max_workers=int(self.settings.sfz_workers or 1), thread_name_prefix="mrp-sfz")
+        self.sfz_pool = PersistentSfizzPool(
+            max_workers=int(self.settings.sfz_workers or 1),
+            blocksize=self.settings.blocksize,
+            samplerate=self.settings.samplerate,
+            quality=self.settings.quality,
+            polyphony=self.settings.polyphony,
+            memory_budget_bytes=self.settings.sfz_resident_memory,
+            worker_path=self.settings.sfizz_worker,
+            library_path=self.settings.sfizz_library,
+        )
         # Embedded FluidSynth gets process isolation. The pool is persistent for
         # the coordinator lifetime, so interpreter/native-library startup is not
         # paid once per song even though synth/SoundFont session state is still
@@ -487,7 +485,7 @@ class RenderingCoordinator:
         self._backpressure_active = False
 
     def close(self) -> None:
-        self.sfz_pool.shutdown(wait=True, cancel_futures=True)
+        self.sfz_pool.close()
         self.gm_pool.shutdown(wait=True, cancel_futures=True)
         self.fx_pool.shutdown(wait=True, cancel_futures=True)
         self.mix_pool.shutdown(wait=True, cancel_futures=True)
@@ -656,24 +654,27 @@ class RenderingCoordinator:
             task = queue.popleft()
             if task.song_id not in self.active or self.active[task.song_id].failed:
                 continue
-            if self.inflight_by_backend[task.backend] < self._backend_cap(task.backend):
+            if self._task_dispatchable(task):
                 return task
             queue.append(task)
         return None
+
+    def _task_dispatchable(self, task: RenderTask) -> bool:
+        if self.inflight_by_backend[task.backend] >= self._backend_cap(task.backend):
+            return False
+        if task.backend == Backend.SFZ:
+            if not isinstance(task.payload, RenderJob):
+                raise RuntimeError("SFZ task payload must be a RenderJob")
+            return self.sfz_pool.can_accept(task.payload)
+        return True
 
     def _submit(self, task: RenderTask) -> None:
         if self.state is not None:
             self.state.task_started(task)
         if task.backend == Backend.SFZ:
-            payload = task.payload
-            if isinstance(payload, RenderJob):
-                if self.sfizz_render is None:
-                    self.sfizz_render = require_sfizz_render()
-                payload = _SFZPayload(
-                    payload, self.settings.blocksize, self.settings.samplerate,
-                    self.settings.quality, self.settings.polyphony, self.sfizz_render
-                )
-            future = self.sfz_pool.submit(_execute_sfz, payload)
+            if not isinstance(task.payload, RenderJob):
+                raise RuntimeError("SFZ task payload must be a RenderJob")
+            future = self.sfz_pool.submit(task.payload, seed=SFIZZ_TASK_SEED)
         elif task.backend == Backend.FLUIDSYNTH:
             payload = task.payload
             if isinstance(payload, tuple):
@@ -709,6 +710,18 @@ class RenderingCoordinator:
             if isinstance(execution, _TaskExecution):
                 value = execution.value
                 diagnostics = execution.diagnostics
+            elif isinstance(execution, PersistentSfizzExecution):
+                value = [execution.stem]
+                diagnostics = execution.diagnostics
+                if self.logger is not None and self.logger.verbose:
+                    state = "cold" if execution.cold_load else "warm"
+                    self.logger.scheduler(
+                        f"sfz {state} · {execution.stem.patch.name} · "
+                        f"resident={execution.resident_bytes / (1024 ** 3):.2f}GiB",
+                        backend="sfz",
+                        resident_bytes=execution.resident_bytes,
+                        cold_load=execution.cold_load,
+                    )
             else:
                 value = execution
                 diagnostics = ""
@@ -785,10 +798,8 @@ class RenderingCoordinator:
 
     def _task_label(self, task: RenderTask) -> str:
         payload = task.payload
-        if task.backend == Backend.SFZ:
-            job = payload.job if isinstance(payload, _SFZPayload) else payload
-            if isinstance(job, RenderJob):
-                return f"{job.track.index:02d} {job.instrument} · sfz"
+        if task.backend == Backend.SFZ and isinstance(payload, RenderJob):
+            return f"{payload.track.index:02d} {payload.instrument} · sfz"
         if task.backend == Backend.FLUIDSYNTH:
             jobs = payload.jobs if isinstance(payload, _GMPayload) else payload
             if isinstance(jobs, tuple):
@@ -803,6 +814,9 @@ class RenderingCoordinator:
         if task.backend == Backend.MIXER and isinstance(payload, _MixPayload):
             return f"{len(payload.stems)} stem{'s' if len(payload.stems) != 1 else ''}"
         return ",".join(task.stem_ids)
+
+    def sfz_stats(self) -> PersistentSfizzStats:
+        return self.sfz_pool.stats()
 
     def _emit_progress(self, *, force: bool = False) -> None:
         if self.logger is None or not self.logger.batch_mode or self.total_songs is None:

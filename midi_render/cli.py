@@ -34,7 +34,13 @@ from .renderer import (
     FluidSynthJob,
     RenderJob,
     RenderedStem,
-    find_sfizz_render,
+)
+from .sfizz_persistent import (
+    find_sfizz_library,
+    find_sfizz_worker,
+    format_bytes,
+    probe_sfizz_runtime,
+    sfizz_renderer_identity,
 )
 from .system import (
     Backend,
@@ -53,6 +59,37 @@ from .system import (
 DEFAULT_CONFIG = Path("config/patches.toml")
 
 
+def _parse_byte_size(value: str) -> int | None:
+    text = value.strip().lower()
+    if text == "auto":
+        return None
+    units = {
+        "b": 1,
+        "kib": 1024,
+        "mib": 1024 ** 2,
+        "gib": 1024 ** 3,
+        "kb": 1000,
+        "mb": 1000 ** 2,
+        "gb": 1000 ** 3,
+    }
+    for suffix in sorted(units, key=len, reverse=True):
+        if text.endswith(suffix):
+            number = text[:-len(suffix)].strip()
+            break
+    else:
+        suffix = "b"
+        number = text
+    try:
+        result = int(float(number) * units[suffix])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "memory size must look like auto, 12GiB, 4096MiB, or bytes"
+        ) from exc
+    if result <= 0:
+        raise argparse.ArgumentTypeError("memory size must be > 0")
+    return result
+
+
 def _registry(path: Path) -> PatchRegistry:
     if not path.is_file():
         raise SystemExit(f"FAIL: patch config not found: {path}")
@@ -69,8 +106,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for line in registry.doctor_lines():
         print(line)
     print()
-    sfizz = find_sfizz_render()
-    print(f"command  {'OK' if sfizz else 'MISSING':7s}  sfizz_render  {sfizz or ''}")
+    sfizz_worker = find_sfizz_worker(registry.tools_root / "mrp-sfizz-worker")
+    sfizz_library = find_sfizz_library(registry.sfizz_library)
+    print(
+        f"command  {'OK' if sfizz_worker else 'MISSING':7s}  "
+        f"mrp-sfizz-worker  {sfizz_worker or ''}"
+    )
+    print(
+        f"library  {'OK' if sfizz_library else 'MISSING':7s}  "
+        f"MRP libsfizz      {sfizz_library or ''}"
+    )
+    if sfizz_worker is not None and sfizz_library is not None:
+        try:
+            _, _, offline_api = probe_sfizz_runtime(
+                worker=sfizz_worker, library=sfizz_library
+            )
+            print(f"sfizz    OK       offline API v{offline_api}")
+        except Exception as exc:
+            print(f"sfizz    FAIL     {exc}")
 
     effect_backends = {
         str(cfg.get("backend", registry.effect_renderer.backend)).strip().lower()
@@ -252,10 +305,12 @@ def _sfz_render_cache_tag(
     samplerate: int,
     quality: int,
     polyphony: int,
+    renderer_identity: dict[str, object] | None = None,
 ) -> str:
+    identity = renderer_identity or sfizz_renderer_identity()
     return _render_cache_tag(
         {
-            "schema": "raw-sfz-v2",
+            "schema": "raw-sfz-v3",
             "prepared_midi": _prepared_midi_cache_identity(prepared_midi),
             "patch": {
                 "name": patch.name,
@@ -263,7 +318,7 @@ def _sfz_render_cache_tag(
                 "asset": _asset_cache_identity(patch.sfz, hash_content=True),
             },
             "renderer": {
-                "kind": "sfizz_render",
+                **identity,
                 "blocksize": blocksize,
                 "samplerate": samplerate,
                 "quality": quality,
@@ -271,7 +326,6 @@ def _sfz_render_cache_tag(
             },
         }
     )
-
 
 def _gm_render_cache_tag(
     prepared_midi: Path,
@@ -381,8 +435,12 @@ def _render_policy(track, resolution, registry: PatchRegistry) -> tuple[str, boo
     return melody_render_instrument(track) or "melody", False, None, True
 
 
-def _render_settings_from_args(args: argparse.Namespace, *, active_songs: int = 1) -> RenderSettings:
+def _render_settings_from_args(
+    args: argparse.Namespace, *, active_songs: int = 1, registry: PatchRegistry | None = None
+) -> RenderSettings:
     workers = int(getattr(args, "workers", getattr(args, "jobs", 5)))
+    sfizz_worker = None if registry is None else registry.tools_root / "mrp-sfizz-worker"
+    sfizz_library = None if registry is None else registry.sfizz_library
     return RenderSettings(
         workers=workers,
         sfz_workers=getattr(args, "sfz_workers", None),
@@ -398,6 +456,9 @@ def _render_settings_from_args(args: argparse.Namespace, *, active_songs: int = 
         keep_work=bool(args.keep_work),
         active_songs=active_songs,
         max_fx_backlog=getattr(args, "max_fx_backlog", None),
+        sfz_resident_memory=getattr(args, "sfz_resident_memory", None),
+        sfizz_worker=sfizz_worker,
+        sfizz_library=sfizz_library,
     ).normalized()
 
 
@@ -424,6 +485,9 @@ def _batch_run_identity(registry: PatchRegistry, settings: RenderSettings) -> st
         "assets": assets,
         "gm": gm_asset,
         "fx_tool": tool_asset,
+        "sfizz_renderer": sfizz_renderer_identity(
+            worker=settings.sfizz_worker, library=settings.sfizz_library
+        ),
         "settings": {
             "blocksize": settings.blocksize,
             "samplerate": settings.samplerate,
@@ -509,6 +573,9 @@ def _build_song_plan(
                 samplerate=settings.samplerate,
                 quality=settings.quality,
                 polyphony=settings.polyphony,
+                renderer_identity=sfizz_renderer_identity(
+                    worker=settings.sfizz_worker, library=settings.sfizz_library
+                ),
             )
             stem = _raw_stem_path(
                 stems_dir,
@@ -671,6 +738,9 @@ def _build_song_plan(
                     samplerate=settings.samplerate,
                     quality=settings.quality,
                     polyphony=settings.polyphony,
+                    renderer_identity=sfizz_renderer_identity(
+                        worker=settings.sfizz_worker, library=settings.sfizz_library
+                    ),
                 )
                 kick_stem = stems_dir / (
                     f"track-{track.index:02d}.drums.kick-layer"
@@ -747,7 +817,7 @@ def _render_logger(args: argparse.Namespace, *, mode: str) -> RenderLogger:
 def cmd_render(args: argparse.Namespace) -> int:
     midi_path = args.midi.resolve()
     registry = _registry(args.config)
-    settings = _render_settings_from_args(args, active_songs=1)
+    settings = _render_settings_from_args(args, active_songs=1, registry=registry)
     output = args.output.resolve() if args.output else _default_render_output(midi_path, args.track).resolve()
     work_dir = args.work_dir.resolve() if args.work_dir else (Path("renders/work") / midi_path.stem).resolve()
     with _render_logger(args, mode="single") as logger:
@@ -793,7 +863,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
         raise SystemExit(f"FAIL: no MIDI files found under {source_root}")
 
     registry = _registry(args.config)
-    settings = _render_settings_from_args(args, active_songs=args.active_songs)
+    settings = _render_settings_from_args(args, active_songs=args.active_songs, registry=registry)
     output_root = args.output_dir.resolve()
     work_root = args.work_root.resolve()
     state = StateStore(args.state_db)
@@ -811,6 +881,10 @@ def cmd_batch(args: argparse.Namespace) -> int:
             gm_workers=settings.gm_workers,
             fx_workers=int(settings.fx_workers or 1),
             mix_workers=settings.mix_workers,
+            sfz_resident_memory=(
+                "auto" if settings.sfz_resident_memory is None
+                else format_bytes(settings.sfz_resident_memory)
+            ),
             state_db=state.path,
             run_identity=run_identity,
         )
@@ -881,6 +955,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             failed_now=len(failed) + len(planning_failures),
             skipped_done=skipped_done,
             skipped_failed=skipped_failed,
+            sfz_stats=coordinator.sfz_stats(),
         )
         for result in failed[:20]:
             logger.failure(song=result.midi_path, stage=None, backend=None, message=result.error or "render failed")
@@ -896,6 +971,13 @@ def _add_render_engine_args(p: argparse.ArgumentParser, *, batch: bool = False) 
     else:
         p.add_argument("--jobs", type=int, default=5, help="global concurrent task budget")
     p.add_argument("--sfz-workers", type=int, help="maximum simultaneous SFZ tasks")
+    p.add_argument(
+        "--sfz-resident-memory",
+        type=_parse_byte_size,
+        default=None,
+        metavar="SIZE",
+        help="resident SFZ RAM budget (e.g. 12GiB; default: auto)",
+    )
     p.add_argument("--gm-workers", type=int, default=1, help="persistent FluidSynth worker processes")
     p.add_argument("--fx-workers", type=int, help="maximum simultaneous FX-chain tasks")
     p.add_argument("--mix-workers", type=int, default=1, help="maximum simultaneous mix/export tasks")

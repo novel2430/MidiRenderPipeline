@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import ctypes
 from pathlib import Path
-import os
-import shutil
-import subprocess
-import sysconfig
 import tempfile
 import time
 
@@ -61,40 +56,6 @@ class RenderedStem:
     backend_log: str = ""
 
 
-def _is_executable(path: Path) -> bool:
-    return path.is_file() and os.access(path, os.X_OK)
-
-
-def find_sfizz_render() -> Path | None:
-    """Find the sfizz-render helper.
-
-    pysfizz wheels ship the binary under ``site-packages/bin/sfizz_render``
-    instead of the virtualenv's normal ``bin`` directory. Prefer a normal
-    PATH installation, then fall back to that wheel layout.
-    """
-    found = shutil.which("sfizz_render")
-    if found:
-        return Path(found).resolve()
-
-    purelib = Path(sysconfig.get_paths()["purelib"])
-    for name in ("sfizz_render", "sfizz-render"):
-        candidate = purelib / "bin" / name
-        if _is_executable(candidate):
-            return candidate.resolve()
-
-    return None
-
-
-def require_sfizz_render() -> str:
-    path = find_sfizz_render()
-    if path is None:
-        raise RuntimeError(
-            "sfizz_render not found. Install the project dependencies (pysfizz) "
-            "or put sfizz_render in PATH."
-        )
-    return str(path)
-
-
 _FLUIDSYNTH_LIBRARY_CACHE: FluidSynthLibrary | None = None
 
 
@@ -107,83 +68,6 @@ def require_fluidsynth_library() -> FluidSynthLibrary:
         return _FLUIDSYNTH_LIBRARY_CACHE
     except FluidSynthNativeError as exc:
         raise RuntimeError(str(exc)) from exc
-
-
-def _run_job(
-    job: RenderJob,
-    sfizz_render: str,
-    blocksize: int,
-    samplerate: int,
-    quality: int,
-    polyphony: int,
-) -> RenderedStem:
-    job.output.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sfizz_render,
-        "--sfz", str(job.patch.sfz),
-        "--midi", str(job.split_midi),
-        "--wav", str(job.output),
-        "--blocksize", str(blocksize),
-        "--samplerate", str(samplerate),
-        "--quality", str(quality),
-        "--polyphony", str(polyphony),
-    ]
-
-    t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    dt = time.perf_counter() - t0
-    diagnostic = "\n".join(x.strip() for x in (proc.stdout, proc.stderr) if x and x.strip())
-    if proc.returncode != 0:
-        suffix = f": {diagnostic}" if diagnostic else ""
-        raise RuntimeError(
-            f"track {job.track.index} {job.track.name!r}: "
-            f"sfizz_render returned {proc.returncode}{suffix}"
-        )
-
-    return RenderedStem(
-        track=job.track,
-        instrument=job.instrument,
-        patch=job.patch,
-        path=job.output,
-        render_seconds=dt,
-        backend_log=diagnostic,
-    )
-
-
-def render_jobs(
-    jobs: list[RenderJob],
-    *,
-    workers: int,
-    blocksize: int,
-    samplerate: int,
-    quality: int,
-    polyphony: int,
-) -> list[RenderedStem]:
-    if not jobs:
-        return []
-
-    sfizz_render = require_sfizz_render()
-    results: list[RenderedStem] = []
-
-    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
-        futures = {
-            pool.submit(
-                _run_job,
-                job,
-                sfizz_render,
-                blocksize,
-                samplerate,
-                quality,
-                polyphony,
-            ): job
-            for job in jobs
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-
-    results.sort(key=lambda x: x.track.index)
-    return results
 
 
 def _copy_track(track: mido.MidiTrack) -> mido.MidiTrack:

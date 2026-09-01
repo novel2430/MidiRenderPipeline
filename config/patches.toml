@@ -6,6 +6,8 @@ instruments = "../resources/instruments"
 fx = "../resources/fx"
 lv2 = "../resources/fx/lv2"
 tools = "../resources/tools"
+# Optional. If omitted, MRP_LIBSFIZZ/LIBSFIZZ and standard library paths are checked.
+# sfizz_library = "/home/novel2430/src/sfizz/install-mrp/lib64/libsfizz.so.1.2."
 
 # One native process handles a stem's complete LV2 chain in 1024-frame blocks.
 # Effects may still opt into backend = "lv2apply" individually as a legacy

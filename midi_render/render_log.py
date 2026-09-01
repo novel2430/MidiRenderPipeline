@@ -162,6 +162,7 @@ class RenderLogger:
         gm_workers: int,
         fx_workers: int,
         mix_workers: int,
+        sfz_resident_memory: str,
         state_db: Path,
         run_identity: str,
     ) -> None:
@@ -174,6 +175,7 @@ class RenderLogger:
                     "muted",
                 )
             )
+            self._line(self._style(f"  SFZ resident RAM: {sfz_resident_memory}", "muted"))
             self._line(self._style(f"  state: {state_db}", "muted"))
             self._line(self._style(f"  run:   {run_identity}", "muted"))
         self._event(
@@ -182,6 +184,7 @@ class RenderLogger:
             active_songs=active_songs,
             workers=workers,
             backend_caps={"sfz": sfz_workers, "gm": gm_workers, "fx": fx_workers, "mix": mix_workers},
+            sfz_resident_memory=sfz_resident_memory,
             state_db=str(state_db),
             run_identity=run_identity,
         )
@@ -360,6 +363,7 @@ class RenderLogger:
         failed_now: int,
         skipped_done: int,
         skipped_failed: int,
+        sfz_stats: Any | None = None,
     ) -> None:
         self.finish_status()
         self._event(
@@ -369,6 +373,17 @@ class RenderLogger:
             failed_now=failed_now,
             skipped_done=skipped_done,
             skipped_failed=skipped_failed,
+            sfz_stats=(
+                None if sfz_stats is None else {
+                    "tasks": sfz_stats.tasks,
+                    "cold_loads": sfz_stats.cold_loads,
+                    "warm_renders": sfz_stats.warm_renders,
+                    "evictions": sfz_stats.evictions,
+                    "worker_failures": sfz_stats.worker_failures,
+                    "peak_resident_bytes": sfz_stats.peak_resident_bytes,
+                    "memory_budget_bytes": sfz_stats.memory_budget_bytes,
+                }
+            ),
         )
         self._line()
         status_key = "done" if failed_now == 0 else "warn"
@@ -377,6 +392,16 @@ class RenderLogger:
         self._line(f"  failed now      {failed_now:,}")
         self._line(f"  skipped DONE    {skipped_done:,}")
         self._line(f"  skipped FAILED  {skipped_failed:,}")
+        if sfz_stats is not None and sfz_stats.tasks:
+            hit_rate = 100.0 * sfz_stats.warm_renders / sfz_stats.tasks
+            self._line("  SFZ renderer")
+            self._line(f"    tasks           {sfz_stats.tasks:,}")
+            self._line(f"    cold loads      {sfz_stats.cold_loads:,}")
+            self._line(f"    warm renders    {sfz_stats.warm_renders:,}")
+            self._line(f"    warm hit rate   {hit_rate:.1f}%")
+            self._line(f"    peak resident   {sfz_stats.peak_resident_bytes / (1024 ** 3):.2f} GiB")
+            self._line(f"    evictions       {sfz_stats.evictions:,}")
+            self._line(f"    worker failures {sfz_stats.worker_failures:,}")
 
     def _stage_key(self, stage: str, backend: str) -> str:
         if stage == "fx":

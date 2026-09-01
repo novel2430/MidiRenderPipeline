@@ -348,3 +348,28 @@ New logging controls:
 
 `NO_COLOR` is respected when color mode is `auto`. The JSONL sink records structured
 rendering events suitable for long corpus runs.
+
+
+## v0.5.0 persistent RAM-resident sfizz backend
+
+The per-stem `sfizz_render` subprocess path has been replaced by an
+instrument-affine persistent sfizz pool backed by the pinned MRP sfizz fork. One
+worker process owns one loaded SFZ/Synth and reuses its RAM-resident samples across
+matching tasks. Each task begins from the fork's offline baseline with deterministic
+seed 0. Multiple worker processes may render concurrently, while V1 keeps at most
+one replica of any InstrumentKey.
+
+Build the project-local worker with `make native-sfizz-worker` (or `make native`)
+and configure the forked library with `[paths].sfizz_library` or `MRP_LIBSFIZZ`.
+`pysfizz`/`sfizz_render` is no longer the production SFZ dependency.
+
+`--sfz-workers` remains the execution-concurrency cap. New
+`--sfz-resident-memory SIZE` controls the independent resident RAM budget; `auto`
+is the default. Actual instrument cost is recorded with a 64-bit sfizz allocation
+query. Idle workers are evicted LRU when necessary; running workers are never
+evicted. All resident processes terminate when the coordinator closes.
+
+Raw SFZ cache identity moves to `raw-sfz-v3` and includes the persistent renderer
+contract, deterministic task seed, worker protocol/API version, and binary
+identities of the worker and libsfizz when available. Old `sfizz_render` raw cache
+entries are therefore not reused accidentally.

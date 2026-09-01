@@ -5,27 +5,6 @@ import mido
 import midi_render.renderer as renderer
 
 
-def test_find_sfizz_render_from_path(monkeypatch, tmp_path: Path):
-    binary = tmp_path / "sfizz_render"
-    binary.write_text("#!/bin/sh\n")
-    binary.chmod(0o755)
-
-    monkeypatch.setattr(renderer.shutil, "which", lambda name: str(binary))
-    assert renderer.find_sfizz_render() == binary.resolve()
-
-
-def test_find_sfizz_render_from_pysfizz_wheel(monkeypatch, tmp_path: Path):
-    purelib = tmp_path / "lib" / "python3.14" / "site-packages"
-    binary = purelib / "bin" / "sfizz_render"
-    binary.parent.mkdir(parents=True)
-    binary.write_text("#!/bin/sh\n")
-    binary.chmod(0o755)
-
-    monkeypatch.setattr(renderer.shutil, "which", lambda name: None)
-    monkeypatch.setattr(renderer.sysconfig, "get_paths", lambda: {"purelib": str(purelib)})
-    assert renderer.find_sfizz_render() == binary.resolve()
-
-
 def _make_split_midi(path: Path, *, channel: int, program: int, extra_channel: int | None = None):
     mid = mido.MidiFile(type=1, ticks_per_beat=480)
     conductor = mido.MidiTrack()
