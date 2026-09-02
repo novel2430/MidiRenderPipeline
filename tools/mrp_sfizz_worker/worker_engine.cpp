@@ -29,7 +29,7 @@ LoadStats WorkerEngine::load(const std::string& sfz_path) {
     if (instrument_loaded_)
         throw std::runtime_error("worker already owns an instrument; start a new worker to load another SFZ");
 
-    api_.set_offline_ram_loading(synth_, true);
+    api_.set_offline_sample_loading_mode(synth_, cfg_.sample_loading);
     auto t0 = Clock::now();
     if (!api_.load_file(synth_, sfz_path.c_str()))
         throw std::runtime_error("libsfizz failed to load SFZ: " + sfz_path);
@@ -135,5 +135,6 @@ RenderStats WorkerEngine::render(const EventFile& evf, const std::string& output
     s.frames = writer.frames_written();
     s.active_voices_after = api_.get_num_active_voices(synth_);
     s.tail_limit_hit = limit_hit;
+    s.sfizz_bytes = api_.get_num_bytes64(synth_);
     return s;
 }

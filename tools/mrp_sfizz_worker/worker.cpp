@@ -23,7 +23,14 @@ std::vector<std::string> split_tab(const std::string& s) {
 }
 
 void usage() {
-    std::cerr << "usage: mrp-sfizz-worker --libsfizz PATH [--sample-rate 48000] [--block-size 1024] [--polyphony 256] [--quality 2]\n";
+    std::cerr << "usage: mrp-sfizz-worker --libsfizz PATH [--sample-rate 48000] [--block-size 1024] [--polyphony 256] [--quality 2] [--sample-loading deterministic-lazy|full-ram|default]\n";
+}
+
+sfizz_offline_sample_loading_mode_t parse_sample_loading(const std::string& value) {
+    if (value == "deterministic-lazy") return SFIZZ_OFFLINE_LOADING_DETERMINISTIC_LAZY;
+    if (value == "full-ram") return SFIZZ_OFFLINE_LOADING_FULL_RAM;
+    if (value == "default") return SFIZZ_OFFLINE_LOADING_DEFAULT;
+    throw std::runtime_error("invalid --sample-loading value: " + value);
 }
 }
 
@@ -42,6 +49,7 @@ int main(int argc, char** argv) {
             else if (a == "--block-size") cfg.block_size = std::stoi(need("--block-size"));
             else if (a == "--polyphony") cfg.polyphony = std::stoi(need("--polyphony"));
             else if (a == "--quality") cfg.quality = std::stoi(need("--quality"));
+            else if (a == "--sample-loading") cfg.sample_loading = parse_sample_loading(need("--sample-loading"));
             else if (a == "--max-tail-seconds") cfg.max_tail_seconds = std::stod(need("--max-tail-seconds"));
             else if (a == "-h" || a == "--help") { usage(); return 0; }
             else throw std::runtime_error("unknown option: " + a);
@@ -50,12 +58,13 @@ int main(int argc, char** argv) {
 
         SfizzDyn api(lib);
         const unsigned int offline_api = api.get_offline_render_api_version();
-        if (offline_api < 1)
+        if (offline_api < 2)
             throw std::runtime_error("libsfizz offline render API version is unsupported");
         WorkerEngine engine(api, cfg);
-        std::cout << "READY\tprotocol=3\tsample_rate=" << cfg.sample_rate
+        std::cout << "READY\tprotocol=4\tsample_rate=" << cfg.sample_rate
                   << "\tblock_size=" << cfg.block_size << "\tpolyphony=" << cfg.polyphony
-                  << "\tquality=" << cfg.quality << "\toffline_api=" << offline_api << std::endl;
+                  << "\tquality=" << cfg.quality << "\toffline_api=" << offline_api
+                  << "\tsample_loading=" << static_cast<int>(cfg.sample_loading) << std::endl;
 
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -77,7 +86,8 @@ int main(int argc, char** argv) {
                     std::cout << std::fixed << std::setprecision(3)
                               << "OK\tRENDER\tms=" << s.milliseconds << "\tframes=" << s.frames
                               << "\tactive_after=" << s.active_voices_after << "\ttail_limit=" << (s.tail_limit_hit ? 1 : 0)
-                              << "\tinstrument_loads=" << engine.instrument_load_count() << std::endl;
+                              << "\tinstrument_loads=" << engine.instrument_load_count()
+                              << "\tsfizz_bytes=" << s.sfizz_bytes << std::endl;
                 } else if (p[0] == "PING") {
                     std::cout << "OK\tPONG" << std::endl;
                 } else if (p[0] == "QUIT") {

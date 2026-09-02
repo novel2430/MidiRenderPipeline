@@ -20,10 +20,12 @@ import mido
 from .renderer import RenderJob, RenderedStem
 
 
-SFIZZ_WORKER_PROTOCOL = 3
-SFIZZ_OFFLINE_API_VERSION = 1
+SFIZZ_WORKER_PROTOCOL = 4
+SFIZZ_OFFLINE_API_VERSION = 2
 SFIZZ_TASK_SEED = 0
-SFIZZ_RENDERER_CONTRACT = "mrp-persistent-sfizz-v1"
+SFIZZ_SAMPLE_LOADING = "deterministic-lazy"
+SFIZZ_SAMPLE_LOADING_CODE = 2
+SFIZZ_RENDERER_CONTRACT = "mrp-persistent-sfizz-v2"
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 _UNKNOWN_INSTRUMENT_RESERVATION = 5 * _GIB
@@ -87,6 +89,7 @@ class WorkerRenderInfo:
     active_after: int
     tail_limit: bool
     instrument_loads: int
+    sfizz_bytes: int
     diagnostics: str = ""
 
 
@@ -227,6 +230,7 @@ def sfizz_renderer_identity(
         "contract": SFIZZ_RENDERER_CONTRACT,
         "worker_protocol": SFIZZ_WORKER_PROTOCOL,
         "offline_api": SFIZZ_OFFLINE_API_VERSION,
+        "sample_loading": SFIZZ_SAMPLE_LOADING,
         "task_seed": SFIZZ_TASK_SEED,
     }
     for name, path in (("worker", worker_path), ("libsfizz", library_path)):
@@ -478,6 +482,7 @@ class ResidentSfizzWorker:
             "--sample-rate", str(samplerate),
             "--quality", str(quality),
             "--polyphony", str(polyphony),
+            "--sample-loading", SFIZZ_SAMPLE_LOADING,
         ]
         self.process = _WorkerProcess(command)
         self._diag_cursor = self.process.diagnostic_cursor()
@@ -493,6 +498,9 @@ class ResidentSfizzWorker:
         if int(values.get("offline_api", 0)) < SFIZZ_OFFLINE_API_VERSION:
             self.close(graceful=False)
             raise RuntimeError(f"unsupported sfizz offline API: {ready}")
+        if int(values.get("sample_loading", -1)) != SFIZZ_SAMPLE_LOADING_CODE:
+            self.close(graceful=False)
+            raise RuntimeError(f"unexpected sfizz sample-loading mode: {ready}")
 
     @property
     def pid(self) -> int:
@@ -536,6 +544,7 @@ class ResidentSfizzWorker:
             active_after=int(values["active_after"]),
             tail_limit=bool(int(values["tail_limit"])),
             instrument_loads=int(values["instrument_loads"]),
+            sfizz_bytes=int(values["sfizz_bytes"]),
             diagnostics=self._new_diagnostics(),
         )
 
@@ -582,6 +591,11 @@ def probe_sfizz_runtime(
             raise RuntimeError(
                 f"sfizz offline API {offline_api} < {SFIZZ_OFFLINE_API_VERSION}"
             )
+        if int(values.get("sample_loading", -1)) != SFIZZ_SAMPLE_LOADING_CODE:
+            raise RuntimeError(
+                f"sfizz sample-loading mode {values.get('sample_loading')} != "
+                f"{SFIZZ_SAMPLE_LOADING_CODE}"
+            )
         return worker_path, library_path, offline_api
     finally:
         process.close()
@@ -591,7 +605,7 @@ class PersistentSfizzPool:
     """Instrument-affine resident sfizz process pool.
 
     One resident process owns one Synth/instrument for its lifetime and executes
-    tasks serially. V1 intentionally permits at most one resident replica per
+    tasks serially. The current design intentionally permits at most one resident replica per
     InstrumentKey. Multiple different resident processes may render concurrently.
     """
 
@@ -648,6 +662,16 @@ class PersistentSfizzPool:
 
     def _resident_bytes_locked(self) -> int:
         return sum(entry.resident_bytes for entry in self._entries.values())
+
+    def _update_resident_bytes_locked(self, entry: _ResidentEntry, reported_bytes: int) -> None:
+        if reported_bytes <= 0:
+            raise RuntimeError(f"sfizz reported invalid resident size: {reported_bytes}")
+        entry.resident_bytes = reported_bytes
+        previous = self._known_costs.get(entry.key, 0)
+        self._known_costs[entry.key] = max(previous, reported_bytes)
+        self._peak_resident_bytes = max(
+            self._peak_resident_bytes, self._resident_bytes_locked()
+        )
 
     def _estimated_cost_locked(self, key: InstrumentKey) -> int:
         known = self._known_costs.get(key)
@@ -786,13 +810,15 @@ class PersistentSfizzPool:
                 raise RuntimeError(
                     f"resident worker reloaded instrument unexpectedly: {render.instrument_loads} loads"
                 )
+            if render.sfizz_bytes <= 0:
+                raise RuntimeError(f"sfizz reported invalid resident size: {render.sfizz_bytes}")
             if not job.output.is_file():
                 raise RuntimeError(f"sfizz worker produced no output: {job.output}")
             execution = PersistentSfizzExecution(
                 stem=self._make_stem(job, render),
                 diagnostics=render.diagnostics,
                 cold_load=False,
-                resident_bytes=entry.resident_bytes,
+                resident_bytes=render.sfizz_bytes,
             )
         except Exception:
             job.output.unlink(missing_ok=True)
@@ -802,6 +828,7 @@ class PersistentSfizzPool:
         with self._lock:
             current = self._entries.get(entry.key)
             if current is entry:
+                self._update_resident_bytes_locked(entry, render.sfizz_bytes)
                 entry.busy = False
                 entry.last_used = time.monotonic()
                 to_close = self._trim_idle_to_budget_locked()
@@ -885,6 +912,8 @@ class PersistentSfizzPool:
                 raise RuntimeError(
                     f"new resident worker reloaded instrument unexpectedly: {render.instrument_loads} loads"
                 )
+            if render.sfizz_bytes <= 0:
+                raise RuntimeError(f"sfizz reported invalid resident size: {render.sfizz_bytes}")
             if not job.output.is_file():
                 raise RuntimeError(f"sfizz worker produced no output: {job.output}")
             diagnostics = "\n".join(
@@ -894,7 +923,7 @@ class PersistentSfizzPool:
                 stem=self._make_stem(job, render),
                 diagnostics=diagnostics,
                 cold_load=True,
-                resident_bytes=load.sfizz_bytes,
+                resident_bytes=render.sfizz_bytes,
             )
         except Exception:
             job.output.unlink(missing_ok=True)
@@ -916,6 +945,7 @@ class PersistentSfizzPool:
         with self._lock:
             current = self._entries.get(key)
             if current is entry:
+                self._update_resident_bytes_locked(entry, render.sfizz_bytes)
                 entry.busy = False
                 entry.last_used = time.monotonic()
                 to_close = self._trim_idle_to_budget_locked()

@@ -12,6 +12,7 @@ struct EngineConfig {
     int quality = 2;
     double tail_threshold = 1e-12;
     double max_tail_seconds = 30.0;
+    sfizz_offline_sample_loading_mode_t sample_loading = SFIZZ_OFFLINE_LOADING_DETERMINISTIC_LAZY;
 };
 
 struct LoadStats {
@@ -26,6 +27,7 @@ struct RenderStats {
     std::uint64_t frames{};
     int active_voices_after{};
     bool tail_limit_hit{};
+    std::uint64_t sfizz_bytes{};
 };
 
 class WorkerEngine {

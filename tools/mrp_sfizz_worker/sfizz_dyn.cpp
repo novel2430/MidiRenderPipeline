@@ -25,6 +25,7 @@ SfizzDyn::SfizzDyn(const std::string& path) {
     render_block = require<sfizz_render_block_fn>("sfizz_render_block");
     get_offline_render_api_version = require<sfizz_get_offline_render_api_version_fn>("sfizz_get_offline_render_api_version");
     set_offline_ram_loading = require<sfizz_set_offline_ram_loading_fn>("sfizz_set_offline_ram_loading");
+    set_offline_sample_loading_mode = require<sfizz_set_offline_sample_loading_mode_fn>("sfizz_set_offline_sample_loading_mode");
     seal_offline_instrument = require<sfizz_seal_offline_instrument_fn>("sfizz_seal_offline_instrument");
     begin_offline_task = require<sfizz_begin_offline_task_fn>("sfizz_begin_offline_task");
     get_num_active_voices = require<sfizz_get_num_active_voices_fn>("sfizz_get_num_active_voices");

@@ -63,7 +63,7 @@ def test_resident_pool_reuses_one_worker_for_same_instrument(monkeypatch, tmp_pa
 
         def render(self, events, output, *, seed, midi_seconds):
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(2.0, 64, 0, False, self.loads)
+            return persistent.WorkerRenderInfo(2.0, 64, 0, False, self.loads, 100)
 
         def close(self, *, graceful=True):
             self.closed = True
@@ -115,7 +115,7 @@ def test_resident_budget_evicts_idle_lru_before_new_instrument(monkeypatch, tmp_
 
         def render(self, events, output, *, seed, midi_seconds):
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads)
+            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 100)
 
         def close(self, *, graceful=True):
             self.closed = True
@@ -174,7 +174,7 @@ def test_auto_budget_allows_post_load_estimate_overshoot_then_trims(monkeypatch,
                 first_started.set()
                 assert release_first.wait(timeout=2)
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads)
+            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 80 if self.name == "piano.sfz" else 90)
 
         def close(self, *, graceful=True):
             self.closed = True
@@ -243,7 +243,7 @@ def test_explicit_budget_remains_hard_after_unknown_load(monkeypatch, tmp_path: 
                 first_started.set()
                 assert release_first.wait(timeout=2)
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads)
+            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 80 if self.name == "piano.sfz" else 90)
 
         def close(self, *, graceful=True):
             pass
@@ -299,7 +299,7 @@ def test_busy_instrument_has_no_replica_in_v1(monkeypatch, tmp_path: Path):
             started.set()
             assert release.wait(timeout=2)
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads)
+            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 100)
 
         def close(self, *, graceful=True):
             pass
@@ -418,3 +418,54 @@ def test_renderer_identity_is_portable_across_install_paths(tmp_path: Path):
     assert left_identity == right_identity
     assert "path" not in left_identity["worker"]
     assert "mtime_ns" not in left_identity["worker"]
+
+
+def test_resident_accounting_grows_after_lazy_first_touch(monkeypatch, tmp_path: Path):
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            self.loads = 0
+            self.renders = 0
+
+        def load(self, sfz):
+            self.loads += 1
+            return persistent.WorkerLoadInfo(1.0, 1, 1, 100)
+
+        def render(self, events, output, *, seed, midi_seconds):
+            self.renders += 1
+            output.write_bytes(b"wav")
+            resident = 240 if self.renders == 1 else 320
+            return persistent.WorkerRenderInfo(
+                1.0, 64, 0, False, self.loads, resident
+            )
+
+        def close(self, *, graceful=True):
+            pass
+
+    monkeypatch.setattr(
+        persistent,
+        "require_sfizz_runtime",
+        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
+    )
+    job = _job(tmp_path, "piano", "piano.sfz")
+    pool = persistent.PersistentSfizzPool(
+        max_workers=1,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+        memory_budget_bytes=1000,
+        worker_factory=FakeWorker,
+    )
+    try:
+        first = pool.submit(job).result(timeout=2)
+        job.output.unlink()
+        assert first.resident_bytes == 240
+        assert pool.stats().current_resident_bytes == 240
+
+        second = pool.submit(job).result(timeout=2)
+        assert second.resident_bytes == 320
+        stats = pool.stats()
+        assert stats.current_resident_bytes == 320
+        assert stats.peak_resident_bytes == 320
+    finally:
+        pool.close()

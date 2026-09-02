@@ -16,6 +16,12 @@ enum sfizz_process_mode_t {
     SFIZZ_PROCESS_FREEWHEELING = 1,
 };
 
+enum sfizz_offline_sample_loading_mode_t {
+    SFIZZ_OFFLINE_LOADING_DEFAULT = 0,
+    SFIZZ_OFFLINE_LOADING_FULL_RAM = 1,
+    SFIZZ_OFFLINE_LOADING_DETERMINISTIC_LAZY = 2,
+};
+
 using sfizz_create_synth_fn = sfizz_synth_t* (*)();
 using sfizz_free_fn = void (*)(sfizz_synth_t*);
 using sfizz_load_file_fn = bool (*)(sfizz_synth_t*, const char*);
@@ -34,6 +40,8 @@ using sfizz_send_poly_aftertouch_fn = void (*)(sfizz_synth_t*, int, int, int);
 using sfizz_render_block_fn = void (*)(sfizz_synth_t*, float**, int, int);
 using sfizz_get_offline_render_api_version_fn = unsigned int (*)();
 using sfizz_set_offline_ram_loading_fn = void (*)(sfizz_synth_t*, bool);
+using sfizz_set_offline_sample_loading_mode_fn = void (*)(
+    sfizz_synth_t*, sfizz_offline_sample_loading_mode_t);
 using sfizz_seal_offline_instrument_fn = bool (*)(sfizz_synth_t*);
 using sfizz_begin_offline_task_fn = bool (*)(sfizz_synth_t*, unsigned int);
 using sfizz_get_num_active_voices_fn = int (*)(sfizz_synth_t*);

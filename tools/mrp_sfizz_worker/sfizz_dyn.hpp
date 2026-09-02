@@ -28,6 +28,7 @@ public:
     sfizz_render_block_fn render_block{};
     sfizz_get_offline_render_api_version_fn get_offline_render_api_version{};
     sfizz_set_offline_ram_loading_fn set_offline_ram_loading{};
+    sfizz_set_offline_sample_loading_mode_fn set_offline_sample_loading_mode{};
     sfizz_seal_offline_instrument_fn seal_offline_instrument{};
     sfizz_begin_offline_task_fn begin_offline_task{};
     sfizz_get_num_active_voices_fn get_num_active_voices{};
