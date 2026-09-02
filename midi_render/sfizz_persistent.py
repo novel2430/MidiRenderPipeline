@@ -115,8 +115,14 @@ class PersistentSfizzStats:
     tasks: int
     worker_starts: int
     worker_reuses: int
+    worker_scale_outs: int
     worker_evictions: int
     worker_failures: int
+    current_resident_workers: int
+    peak_resident_workers: int
+    peak_active_workers: int
+    peak_replicas_per_key: int
+    replica_limit: int
     current_working_set_bytes: int
     peak_working_set_bytes: int
     current_sample_resident_bytes: int
@@ -128,6 +134,7 @@ class PersistentSfizzStats:
 
 @dataclass
 class _ResidentEntry:
+    replica_id: int
     key: InstrumentKey
     label: str
     worker: "ResidentSfizzWorker"
@@ -136,6 +143,14 @@ class _ResidentEntry:
     full_resident_samples: int = 0
     busy: bool = False
     last_used: float = 0.0
+
+
+@dataclass(frozen=True)
+class _AdmissionPlan:
+    entry_id: int | None
+    victim_ids: tuple[int, ...]
+    reservation: int
+    scale_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -623,14 +638,20 @@ def probe_sfizz_runtime(
 
 
 class PersistentSfizzPool:
-    """Instrument-affine persistent sfizz worker pool.
+    """Instrument-affine persistent sfizz worker pool with elastic replicas.
 
-    Each InstrumentKey owns at most one resident worker and executes tasks
-    serially. Memory accounting is based on the workers' observed working set,
-    not the theoretical decoded size of the SFZ. The configured memory budget
-    is therefore a steady-state target: known growth is reserved before a task,
-    idle workers are evicted LRU when needed, and previously unseen workloads
-    are admitted once so their real working set can be learned.
+    Each InstrumentKey owns one or more resident worker replicas up to
+    ``max_replicas_per_key``. Idle replicas are reused preferentially; when all
+    replicas for a warmed instrument are busy, pressure may start another
+    replica if the per-key cap and observed working-set budget allow it.
+
+    Memory accounting is based on workers' observed working sets, not the
+    theoretical decoded size of the SFZ. The configured memory budget is a
+    steady-state target: known growth is reserved before a task, idle workers
+    are evicted globally by LRU when needed, and previously unseen workloads
+    are admitted once so their real footprint can be learned. A key must finish
+    at least one render before it can scale out, preventing multiple unknown
+    first-touch working sets from being admitted concurrently.
     """
 
     def __init__(
@@ -642,11 +663,17 @@ class PersistentSfizzPool:
         quality: int,
         polyphony: int,
         memory_budget_bytes: int | None = None,
+        max_replicas_per_key: int = 1,
         worker_path: Path | None = None,
         library_path: Path | None = None,
         worker_factory: Callable[..., ResidentSfizzWorker] = ResidentSfizzWorker,
     ):
+        if max_workers < 1:
+            raise ValueError("SFZ max workers must be >= 1")
+        if max_replicas_per_key < 1:
+            raise ValueError("SFZ max replicas per key must be >= 1")
         self.max_workers = max_workers
+        self.max_replicas_per_key = max_replicas_per_key
         self.blocksize = blocksize
         self.samplerate = samplerate
         self.quality = quality
@@ -660,10 +687,17 @@ class PersistentSfizzPool:
         if self.memory_budget_bytes <= 0:
             raise ValueError("SFZ memory budget must be > 0")
 
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mrp-sfizz")
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="mrp-sfizz"
+        )
         self._lock = threading.Lock()
-        self._entries: dict[InstrumentKey, _ResidentEntry] = {}
-        self._starting_keys: set[InstrumentKey] = set()
+        # Worker instances, not InstrumentKeys, are the eviction/lifecycle unit.
+        self._entries: dict[int, _ResidentEntry] = {}
+        self._by_key: dict[InstrumentKey, set[int]] = {}
+        self._starting_counts: dict[InstrumentKey, int] = {}
+        self._completed_keys: set[InstrumentKey] = set()
+        self._active_outputs: set[Path] = set()
+        self._next_replica_id = 1
         # Historical observations survive worker eviction and are estimates only.
         self._observed_worker_peak: dict[InstrumentKey, int] = {}
         self._observed_task_growth: dict[InstrumentKey, int] = {}
@@ -673,8 +707,12 @@ class PersistentSfizzPool:
         self._tasks = 0
         self._worker_starts = 0
         self._worker_reuses = 0
+        self._worker_scale_outs = 0
         self._worker_evictions = 0
         self._worker_failures = 0
+        self._peak_resident_workers = 0
+        self._peak_active_workers = 0
+        self._peak_replicas_per_key = 0
         self._peak_working_set_bytes = 0
         self._peak_sample_resident_bytes = 0
         self._max_observed_task_growth_bytes = 0
@@ -687,6 +725,69 @@ class PersistentSfizzPool:
             quality=self.quality,
             polyphony=self.polyphony,
         )
+
+    @staticmethod
+    def _output_key(job: RenderJob) -> Path:
+        return job.output.resolve()
+
+    def _entries_for_key_locked(self, key: InstrumentKey) -> list[_ResidentEntry]:
+        return [
+            self._entries[replica_id]
+            for replica_id in self._by_key.get(key, ())
+            if replica_id in self._entries
+        ]
+
+    def _starting_count_locked(self, key: InstrumentKey) -> int:
+        return self._starting_counts.get(key, 0)
+
+    def _set_starting_delta_locked(self, key: InstrumentKey, delta: int) -> None:
+        value = self._starting_counts.get(key, 0) + delta
+        if value < 0:
+            raise RuntimeError("SFZ starting replica count became negative")
+        if value:
+            self._starting_counts[key] = value
+        else:
+            self._starting_counts.pop(key, None)
+        self._update_parallelism_peaks_locked()
+
+    def _add_entry_locked(self, entry: _ResidentEntry) -> None:
+        self._entries[entry.replica_id] = entry
+        self._by_key.setdefault(entry.key, set()).add(entry.replica_id)
+        self._update_parallelism_peaks_locked()
+
+    def _remove_entry_locked(self, entry: _ResidentEntry) -> bool:
+        current = self._entries.get(entry.replica_id)
+        if current is not entry:
+            return False
+        self._entries.pop(entry.replica_id, None)
+        replica_ids = self._by_key.get(entry.key)
+        if replica_ids is not None:
+            replica_ids.discard(entry.replica_id)
+            if not replica_ids:
+                self._by_key.pop(entry.key, None)
+        return True
+
+    def _active_workers_locked(self) -> int:
+        return sum(1 for entry in self._entries.values() if entry.busy) + sum(
+            self._starting_counts.values()
+        )
+
+    def _update_parallelism_peaks_locked(self) -> None:
+        self._peak_resident_workers = max(
+            self._peak_resident_workers, len(self._entries)
+        )
+        self._peak_active_workers = max(
+            self._peak_active_workers, self._active_workers_locked()
+        )
+        keys = set(self._by_key) | set(self._starting_counts)
+        if keys:
+            current_max = max(
+                len(self._by_key.get(key, ())) + self._starting_counts.get(key, 0)
+                for key in keys
+            )
+            self._peak_replicas_per_key = max(
+                self._peak_replicas_per_key, current_max
+            )
 
     def _working_set_bytes_locked(self) -> int:
         return sum(entry.working_set_bytes for entry in self._entries.values())
@@ -729,32 +830,64 @@ class PersistentSfizzPool:
             self._peak_sample_resident_bytes, self._sample_resident_bytes_locked()
         )
 
+    def _select_idle_entry_locked(self, key: InstrumentKey) -> _ResidentEntry | None:
+        idle = [entry for entry in self._entries_for_key_locked(key) if not entry.busy]
+        if not idle:
+            return None
+        # Prefer the hottest replica for reuse. A larger decoded sample payload is
+        # more likely to contain corpus-common samples; recency breaks ties.
+        return max(
+            idle,
+            key=lambda entry: (
+                entry.sample_resident_bytes,
+                entry.last_used,
+                entry.working_set_bytes,
+            ),
+        )
+
     def _estimated_reservation_locked(
         self, key: InstrumentKey, entry: _ResidentEntry | None
     ) -> int:
         if entry is None:
-            # A recreated worker can use its previously observed high-water mark.
-            # A never-seen instrument has no honest estimate and is admitted once
-            # with a zero reservation so the pool can learn its real footprint.
+            # A recreated/replica worker can use its previously observed
+            # high-water mark. A never-seen instrument has no honest estimate
+            # and is admitted once with zero reservation so the pool can learn.
             return self._observed_worker_peak.get(key, 0)
         return self._observed_task_growth.get(key, 0)
 
     def _admission_plan_locked(
-        self, key: InstrumentKey
-    ) -> tuple[list[InstrumentKey], int] | None:
-        entry = self._entries.get(key)
-        if entry is not None and entry.busy:
+        self, key: InstrumentKey, output_key: Path
+    ) -> _AdmissionPlan | None:
+        if output_key in self._active_outputs:
             return None
-        if entry is None and key in self._starting_keys:
-            return None
+
+        entry = self._select_idle_entry_locked(key)
+        resident = self._entries_for_key_locked(key)
+        starting = self._starting_count_locked(key)
+        scale_out = False
+
+        if entry is None:
+            replicas = len(resident) + starting
+            if replicas >= self.max_replicas_per_key:
+                return None
+            # Never admit multiple unknown first-touch replicas. Once one task has
+            # completed, historical high-water data can safely guide scale-out.
+            if replicas > 0 and key not in self._completed_keys:
+                return None
+            scale_out = replicas > 0
 
         reservation = self._estimated_reservation_locked(key, entry)
         current = self._working_set_bytes_locked() + self._reserved_growth_bytes
         if current + reservation <= self.memory_budget_bytes:
-            return [], reservation
+            return _AdmissionPlan(
+                entry_id=None if entry is None else entry.replica_id,
+                victim_ids=(),
+                reservation=reservation,
+                scale_out=scale_out,
+            )
 
-        # Keep the target worker if it already exists; evict only other idle LRU
-        # workers. Busy workers are never killed for memory admission.
+        # Keep the selected target worker if it already exists; evict only other
+        # idle LRU workers. Busy workers are never killed for memory admission.
         evictable = sorted(
             (
                 candidate
@@ -763,29 +896,38 @@ class PersistentSfizzPool:
             ),
             key=lambda item: item.last_used,
         )
-        plan: list[InstrumentKey] = []
+        victim_ids: list[int] = []
         remaining = current
         for candidate in evictable:
-            plan.append(candidate.key)
+            victim_ids.append(candidate.replica_id)
             remaining -= candidate.working_set_bytes
             if remaining + reservation <= self.memory_budget_bytes:
-                return plan, reservation
+                return _AdmissionPlan(
+                    entry_id=None if entry is None else entry.replica_id,
+                    victim_ids=tuple(victim_ids),
+                    reservation=reservation,
+                    scale_out=scale_out,
+                )
 
-        # The budget is a steady-state target, not a hard allocation limit.
-        # If no other busy worker is causing the pressure, let the target worker
-        # run and learn/refresh its real footprint; it may itself be larger than
-        # the target. This also prevents a conservative historical estimate from
-        # deadlocking the only resident instrument.
+        # The budget is a steady-state target, not a hard allocation limit. If
+        # no other busy worker is causing pressure, let a sole/reused target run
+        # and learn/refresh its real footprint. Scale-out always has another
+        # busy/starting replica and therefore cannot use this escape hatch.
         other_busy = any(
             candidate.busy and candidate is not entry
             for candidate in self._entries.values()
-        )
+        ) or any(self._starting_counts.values())
         if not other_busy:
-            return plan, reservation
+            return _AdmissionPlan(
+                entry_id=None if entry is None else entry.replica_id,
+                victim_ids=tuple(victim_ids),
+                reservation=reservation,
+                scale_out=scale_out,
+            )
         return None
 
     def _trim_idle_to_budget_locked(self) -> list[_ResidentEntry]:
-        """Evict idle LRU workers until the observed steady-state target is met."""
+        """Evict idle LRU worker replicas until the steady-state target is met."""
         current = self._working_set_bytes_locked()
         if current <= self.memory_budget_bytes:
             return []
@@ -795,12 +937,13 @@ class PersistentSfizzPool:
             (entry for entry in self._entries.values() if not entry.busy),
             key=lambda item: item.last_used,
         ):
-            # Keep a sole worker even when its own working set exceeds the
-            # configured target; evicting it cannot make an in-flight task safer
-            # and would destroy useful residency after every render.
+            # Keep a sole worker even when its own working set exceeds the target;
+            # evicting it cannot make an in-flight task safer and would destroy
+            # useful residency after every render.
             if len(self._entries) == 1:
                 break
-            self._entries.pop(candidate.key, None)
+            if not self._remove_entry_locked(candidate):
+                continue
             victims.append(candidate)
             self._worker_evictions += 1
             current -= candidate.working_set_bytes
@@ -810,75 +953,103 @@ class PersistentSfizzPool:
 
     def can_accept(self, job: RenderJob) -> bool:
         key = self._key(job)
+        output_key = self._output_key(job)
         with self._lock:
             if self._closed:
                 return False
-            return self._admission_plan_locked(key) is not None
+            return self._admission_plan_locked(key, output_key) is not None
 
     def submit(self, job: RenderJob, *, seed: int = SFIZZ_TASK_SEED) -> Future:
         key = self._key(job)
+        output_key = self._output_key(job)
         to_close: list[_ResidentEntry] = []
         entry: _ResidentEntry | None = None
         before = 0
         before_sample = 0
         reservation = 0
         worker_started = False
+        scale_out = False
         with self._lock:
             if self._closed:
                 raise RuntimeError("persistent sfizz pool is closed")
-            plan = self._admission_plan_locked(key)
+            if output_key in self._active_outputs:
+                raise RuntimeError(f"SFZ output is already active: {job.output}")
+            plan = self._admission_plan_locked(key, output_key)
             if plan is None:
                 raise RuntimeError("SFZ task submitted without working-set admission")
-            victim_keys, reservation = plan
-            for victim_key in victim_keys:
-                victim = self._entries.pop(victim_key)
+            reservation = plan.reservation
+            scale_out = plan.scale_out
+            for victim_id in plan.victim_ids:
+                victim = self._entries.get(victim_id)
+                if victim is None or victim.busy:
+                    raise RuntimeError("SFZ admission victim changed while pool lock was held")
+                self._remove_entry_locked(victim)
                 to_close.append(victim)
                 self._worker_evictions += 1
 
-            entry = self._entries.get(key)
+            if plan.entry_id is not None:
+                entry = self._entries.get(plan.entry_id)
+                if entry is None or entry.busy:
+                    raise RuntimeError("resident SFZ replica was acquired twice")
+
+            self._active_outputs.add(output_key)
             self._reserved_growth_bytes += reservation
             self._tasks += 1
             if entry is not None:
-                if entry.busy:
-                    raise RuntimeError("resident SFZ worker was acquired twice")
                 entry.busy = True
                 self._worker_reuses += 1
                 before = entry.working_set_bytes
                 before_sample = entry.sample_resident_bytes
+                self._update_parallelism_peaks_locked()
             else:
-                self._starting_keys.add(key)
+                self._set_starting_delta_locked(key, +1)
                 self._worker_starts += 1
+                if scale_out:
+                    self._worker_scale_outs += 1
                 worker_started = True
 
         # Close planned victims before a new task can begin allocating sample
-        # memory. This makes LRU admission an actual memory handoff rather than
-        # merely an accounting update.
+        # memory. This makes LRU admission a real memory handoff.
         for victim in to_close:
             victim.worker.close()
 
         try:
             if worker_started:
-                return self._executor.submit(self._run_new, key, job, seed, reservation)
+                return self._executor.submit(
+                    self._run_new, key, job, output_key, seed, reservation
+                )
             assert entry is not None
             return self._executor.submit(
-                self._run_existing, entry, job, seed, reservation, before, before_sample
+                self._run_existing,
+                entry,
+                job,
+                output_key,
+                seed,
+                reservation,
+                before,
+                before_sample,
             )
         except Exception:
             with self._lock:
+                self._active_outputs.discard(output_key)
                 self._reserved_growth_bytes = max(
                     0, self._reserved_growth_bytes - reservation
                 )
                 if worker_started:
-                    self._starting_keys.discard(key)
+                    self._set_starting_delta_locked(key, -1)
                     self._worker_starts = max(0, self._worker_starts - 1)
-                elif entry is not None and self._entries.get(key) is entry:
+                    if scale_out:
+                        self._worker_scale_outs = max(0, self._worker_scale_outs - 1)
+                elif entry is not None and self._entries.get(entry.replica_id) is entry:
                     entry.busy = False
                     self._worker_reuses = max(0, self._worker_reuses - 1)
                 self._tasks = max(0, self._tasks - 1)
             raise
 
     def _event_path(self, job: RenderJob) -> Path:
-        return job.split_midi.with_suffix(job.split_midi.suffix + f".sr{self.samplerate}.mrpev")
+        return job.split_midi.with_suffix(
+            job.split_midi.suffix + f".sr{self.samplerate}.mrpev"
+        )
 
     def _prepare_events(self, job: RenderJob) -> tuple[Path, MidiEventInfo]:
         path = self._event_path(job)
@@ -925,6 +1096,7 @@ class PersistentSfizzPool:
         self,
         entry: _ResidentEntry,
         job: RenderJob,
+        output_key: Path,
         seed: int,
         reservation: int,
         before_working_set: int,
@@ -942,7 +1114,9 @@ class PersistentSfizzPool:
                     f"resident worker reloaded instrument unexpectedly: {render.instrument_loads} loads"
                 )
             if render.sfizz_bytes <= 0:
-                raise RuntimeError(f"sfizz reported invalid working-set size: {render.sfizz_bytes}")
+                raise RuntimeError(
+                    f"sfizz reported invalid working-set size: {render.sfizz_bytes}"
+                )
             if not job.output.is_file():
                 raise RuntimeError(f"sfizz worker produced no output: {job.output}")
             execution = self._execution(
@@ -956,6 +1130,7 @@ class PersistentSfizzPool:
         except Exception:
             job.output.unlink(missing_ok=True)
             with self._lock:
+                self._active_outputs.discard(output_key)
                 self._reserved_growth_bytes = max(
                     0, self._reserved_growth_bytes - reservation
                 )
@@ -964,8 +1139,11 @@ class PersistentSfizzPool:
 
         to_close: list[_ResidentEntry] = []
         with self._lock:
-            self._reserved_growth_bytes = max(0, self._reserved_growth_bytes - reservation)
-            current = self._entries.get(entry.key)
+            self._active_outputs.discard(output_key)
+            self._reserved_growth_bytes = max(
+                0, self._reserved_growth_bytes - reservation
+            )
+            current = self._entries.get(entry.replica_id)
             if current is entry:
                 self._record_working_set_locked(
                     entry,
@@ -974,6 +1152,7 @@ class PersistentSfizzPool:
                     full_resident_samples=render.full_resident_samples,
                     task_growth_bytes=execution.working_set_growth_bytes,
                 )
+                self._completed_keys.add(entry.key)
                 entry.busy = False
                 entry.last_used = time.monotonic()
                 to_close = self._trim_idle_to_budget_locked()
@@ -982,12 +1161,18 @@ class PersistentSfizzPool:
         return execution
 
     def _run_new(
-        self, key: InstrumentKey, job: RenderJob, seed: int, reservation: int
+        self,
+        key: InstrumentKey,
+        job: RenderJob,
+        output_key: Path,
+        seed: int,
+        reservation: int,
     ) -> PersistentSfizzExecution:
         worker: ResidentSfizzWorker | None = None
         entry: _ResidentEntry | None = None
         extra_evictions: list[_ResidentEntry] = []
         active_reservation = reservation
+        starting_registered = True
         try:
             worker_path, library_path = require_sfizz_runtime(
                 worker=self.worker_path, library=self.library_path
@@ -1003,10 +1188,13 @@ class PersistentSfizzPool:
             )
             load = worker.load(job.patch.sfz)
             if load.sfizz_bytes <= 0:
-                raise RuntimeError(f"sfizz reported invalid working-set size: {load.sfizz_bytes}")
+                raise RuntimeError(
+                    f"sfizz reported invalid working-set size: {load.sfizz_bytes}"
+                )
 
             with self._lock:
-                self._starting_keys.discard(key)
+                self._set_starting_delta_locked(key, -1)
+                starting_registered = False
                 # A new-worker reservation represents the previously observed
                 # whole-worker high-water mark. Once LOAD reveals the baseline,
                 # reserve only the still-unrealized portion before rendering.
@@ -1015,7 +1203,10 @@ class PersistentSfizzPool:
                 )
                 active_reservation = max(0, reservation - load.sfizz_bytes)
                 self._reserved_growth_bytes += active_reservation
+                replica_id = self._next_replica_id
+                self._next_replica_id += 1
                 entry = _ResidentEntry(
+                    replica_id=replica_id,
                     key=key,
                     label=job.patch.name,
                     worker=worker,
@@ -1025,7 +1216,7 @@ class PersistentSfizzPool:
                     busy=True,
                     last_used=time.monotonic(),
                 )
-                self._entries[key] = entry
+                self._add_entry_locked(entry)
                 self._record_working_set_locked(
                     entry,
                     sfizz_bytes=load.sfizz_bytes,
@@ -1051,7 +1242,9 @@ class PersistentSfizzPool:
                     f"new resident worker reloaded instrument unexpectedly: {render.instrument_loads} loads"
                 )
             if render.sfizz_bytes <= 0:
-                raise RuntimeError(f"sfizz reported invalid working-set size: {render.sfizz_bytes}")
+                raise RuntimeError(
+                    f"sfizz reported invalid working-set size: {render.sfizz_bytes}"
+                )
             if not job.output.is_file():
                 raise RuntimeError(f"sfizz worker produced no output: {job.output}")
             diagnostics = "\n".join(
@@ -1068,12 +1261,15 @@ class PersistentSfizzPool:
         except Exception:
             job.output.unlink(missing_ok=True)
             with self._lock:
-                self._starting_keys.discard(key)
+                self._active_outputs.discard(output_key)
+                if starting_registered:
+                    self._set_starting_delta_locked(key, -1)
+                    starting_registered = False
                 self._reserved_growth_bytes = max(
                     0, self._reserved_growth_bytes - active_reservation
                 )
-                if entry is not None and self._entries.get(key) is entry:
-                    self._entries.pop(key, None)
+                if entry is not None:
+                    self._remove_entry_locked(entry)
                 self._worker_failures += 1
             if worker is not None:
                 worker.close(graceful=False)
@@ -1084,10 +1280,11 @@ class PersistentSfizzPool:
         assert entry is not None
         to_close: list[_ResidentEntry] = []
         with self._lock:
+            self._active_outputs.discard(output_key)
             self._reserved_growth_bytes = max(
                 0, self._reserved_growth_bytes - active_reservation
             )
-            current = self._entries.get(key)
+            current = self._entries.get(entry.replica_id)
             if current is entry:
                 self._record_working_set_locked(
                     entry,
@@ -1096,6 +1293,7 @@ class PersistentSfizzPool:
                     full_resident_samples=render.full_resident_samples,
                     task_growth_bytes=execution.working_set_growth_bytes,
                 )
+                self._completed_keys.add(key)
                 entry.busy = False
                 entry.last_used = time.monotonic()
                 to_close = self._trim_idle_to_budget_locked()
@@ -1105,8 +1303,7 @@ class PersistentSfizzPool:
 
     def _invalidate_entry(self, entry: _ResidentEntry) -> None:
         with self._lock:
-            if self._entries.get(entry.key) is entry:
-                self._entries.pop(entry.key, None)
+            self._remove_entry_locked(entry)
             self._worker_failures += 1
         entry.worker.close(graceful=False)
 
@@ -1116,8 +1313,14 @@ class PersistentSfizzPool:
                 tasks=self._tasks,
                 worker_starts=self._worker_starts,
                 worker_reuses=self._worker_reuses,
+                worker_scale_outs=self._worker_scale_outs,
                 worker_evictions=self._worker_evictions,
                 worker_failures=self._worker_failures,
+                current_resident_workers=len(self._entries),
+                peak_resident_workers=self._peak_resident_workers,
+                peak_active_workers=self._peak_active_workers,
+                peak_replicas_per_key=self._peak_replicas_per_key,
+                replica_limit=self.max_replicas_per_key,
                 current_working_set_bytes=self._working_set_bytes_locked(),
                 peak_working_set_bytes=self._peak_working_set_bytes,
                 current_sample_resident_bytes=self._sample_resident_bytes_locked(),
@@ -1138,7 +1341,9 @@ class PersistentSfizzPool:
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
-            self._starting_keys.clear()
+            self._by_key.clear()
+            self._starting_counts.clear()
+            self._active_outputs.clear()
             self._reserved_growth_bytes = 0
         for entry in entries:
             entry.worker.close()

@@ -50,6 +50,7 @@ class Backend(str, Enum):
 class RenderSettings:
     workers: int = 5
     sfz_workers: int | None = None
+    sfz_max_replicas: int = 1
     gm_workers: int = 1
     fx_workers: int | None = None
     mix_workers: int = 1
@@ -78,6 +79,8 @@ class RenderSettings:
         for name, value in (("sfz_workers", sfz), ("gm_workers", gm), ("fx_workers", fx), ("mix_workers", mix)):
             if value < 1:
                 raise ValueError(f"{name} must be >= 1")
+        if self.sfz_max_replicas < 1:
+            raise ValueError("sfz_max_replicas must be >= 1")
         backlog = self.max_fx_backlog
         if backlog is None:
             backlog = max(self.workers * 2, 4)
@@ -88,6 +91,7 @@ class RenderSettings:
         return RenderSettings(
             workers=self.workers,
             sfz_workers=sfz,
+            sfz_max_replicas=self.sfz_max_replicas,
             gm_workers=gm,
             fx_workers=fx,
             mix_workers=mix,
@@ -460,6 +464,7 @@ class RenderingCoordinator:
 
         self.sfz_pool = PersistentSfizzPool(
             max_workers=int(self.settings.sfz_workers or 1),
+            max_replicas_per_key=self.settings.sfz_max_replicas,
             blocksize=self.settings.blocksize,
             samplerate=self.settings.samplerate,
             quality=self.settings.quality,

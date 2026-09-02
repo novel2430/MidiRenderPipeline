@@ -445,6 +445,7 @@ def _render_settings_from_args(
     return RenderSettings(
         workers=workers,
         sfz_workers=getattr(args, "sfz_workers", None),
+        sfz_max_replicas=int(getattr(args, "sfz_max_replicas", 1)),
         gm_workers=int(getattr(args, "gm_workers", 1)),
         fx_workers=getattr(args, "fx_workers", None),
         mix_workers=int(getattr(args, "mix_workers", 1)),
@@ -885,6 +886,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             active_songs=settings.active_songs,
             workers=settings.workers,
             sfz_workers=int(settings.sfz_workers or 1),
+            sfz_max_replicas=settings.sfz_max_replicas,
             gm_workers=settings.gm_workers,
             fx_workers=int(settings.fx_workers or 1),
             mix_workers=settings.mix_workers,
@@ -989,6 +991,12 @@ def _add_render_engine_args(p: argparse.ArgumentParser, *, batch: bool = False) 
         p.add_argument("--jobs", type=int, default=5, help="global concurrent task budget")
     p.add_argument("--sfz-workers", type=int, help="maximum simultaneous SFZ tasks")
     p.add_argument(
+        "--sfz-max-replicas",
+        type=int,
+        default=1,
+        help="maximum resident worker replicas per SFZ instrument key (default: 1)",
+    )
+    p.add_argument(
         "--sfz-memory-budget",
         type=_parse_byte_size,
         default=None,
@@ -1070,6 +1078,7 @@ def main(argv: list[str] | None = None) -> int:
         ("jobs", "--jobs"),
         ("workers", "--workers"),
         ("sfz_workers", "--sfz-workers"),
+        ("sfz_max_replicas", "--sfz-max-replicas"),
         ("gm_workers", "--gm-workers"),
         ("fx_workers", "--fx-workers"),
         ("mix_workers", "--mix-workers"),

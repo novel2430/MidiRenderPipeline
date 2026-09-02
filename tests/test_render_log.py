@@ -97,8 +97,14 @@ def test_batch_summary_reports_normalized_performance_and_peak_memory_only():
             tasks=10,
             worker_starts=2,
             worker_reuses=8,
+            worker_scale_outs=1,
             worker_evictions=1,
             worker_failures=0,
+            current_resident_workers=2,
+            peak_resident_workers=3,
+            peak_active_workers=2,
+            peak_replicas_per_key=2,
+            replica_limit=2,
             current_working_set_bytes=0,
             peak_working_set_bytes=2 * 1024 ** 3,
             current_sample_resident_bytes=0,
@@ -127,5 +133,7 @@ def test_batch_summary_reports_normalized_performance_and_peak_memory_only():
     assert "ms / track-bar     20.0 ms" in text
     assert "peak working set" in text
     assert "peak sample payload" in text
+    assert "scale-outs        1" in text
+    assert "peak replicas/key 2 / 2" in text
     assert "current working set" not in text
     assert "full samples" not in text

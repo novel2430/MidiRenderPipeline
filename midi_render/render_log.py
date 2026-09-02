@@ -172,6 +172,7 @@ class RenderLogger:
         active_songs: int,
         workers: int,
         sfz_workers: int,
+        sfz_max_replicas: int,
         gm_workers: int,
         fx_workers: int,
         mix_workers: int,
@@ -188,6 +189,12 @@ class RenderLogger:
                     "muted",
                 )
             )
+            self._line(
+                self._style(
+                    f"  SFZ replicas/key: {sfz_max_replicas}",
+                    "muted",
+                )
+            )
             self._line(self._style(f"  SFZ memory budget: {sfz_memory_budget}", "muted"))
             self._line(self._style(f"  state: {state_db}", "muted"))
             self._line(self._style(f"  run:   {run_identity}", "muted"))
@@ -197,6 +204,7 @@ class RenderLogger:
             active_songs=active_songs,
             workers=workers,
             backend_caps={"sfz": sfz_workers, "gm": gm_workers, "fx": fx_workers, "mix": mix_workers},
+            sfz_max_replicas=sfz_max_replicas,
             sfz_memory_budget=sfz_memory_budget,
             state_db=str(state_db),
             run_identity=run_identity,
@@ -413,8 +421,14 @@ class RenderLogger:
                     "tasks": sfz_stats.tasks,
                     "worker_starts": sfz_stats.worker_starts,
                     "worker_reuses": sfz_stats.worker_reuses,
+                    "worker_scale_outs": sfz_stats.worker_scale_outs,
                     "worker_evictions": sfz_stats.worker_evictions,
                     "worker_failures": sfz_stats.worker_failures,
+                    "current_resident_workers": sfz_stats.current_resident_workers,
+                    "peak_resident_workers": sfz_stats.peak_resident_workers,
+                    "peak_active_workers": sfz_stats.peak_active_workers,
+                    "peak_replicas_per_key": sfz_stats.peak_replicas_per_key,
+                    "replica_limit": sfz_stats.replica_limit,
                     "current_working_set_bytes": sfz_stats.current_working_set_bytes,
                     "peak_working_set_bytes": sfz_stats.peak_working_set_bytes,
                     "current_sample_resident_bytes": sfz_stats.current_sample_resident_bytes,
@@ -446,6 +460,12 @@ class RenderLogger:
             self._line(f"    starts            {sfz_stats.worker_starts:,}")
             self._line(f"    reuses            {sfz_stats.worker_reuses:,}")
             self._line(f"    reuse rate        {reuse_rate:.1f}%")
+            self._line(f"    scale-outs        {sfz_stats.worker_scale_outs:,}")
+            self._line(f"    peak residents    {sfz_stats.peak_resident_workers:,}")
+            self._line(f"    peak active       {sfz_stats.peak_active_workers:,}")
+            self._line(
+                f"    peak replicas/key {sfz_stats.peak_replicas_per_key:,} / {sfz_stats.replica_limit:,}"
+            )
             self._line(f"    worker evictions  {sfz_stats.worker_evictions:,}")
             self._line(f"    worker failures   {sfz_stats.worker_failures:,}")
             self._line("  SFZ memory")
