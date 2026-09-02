@@ -2,7 +2,7 @@ from pathlib import Path
 
 import mido
 
-from midi_render.midi import analyze_midi, make_note_filtered_midi, make_program_override_midi
+from midi_render.midi import analyze_midi, make_note_filtered_midi, make_program_override_midi, midi_timeline_metrics
 
 
 def test_analyzer_reports_multi_program(tmp_path: Path):
@@ -257,3 +257,19 @@ def test_program_override_applies_velocity_plan_without_shifting_notes(tmp_path:
         if msg.type in {"note_on", "note_off"}:
             note_times.append(absolute)
     assert note_times == [120, 360]
+
+
+def test_midi_timeline_metrics_follow_tempo_and_time_signature():
+    mid = mido.MidiFile(type=1, ticks_per_beat=480)
+    conductor = mido.MidiTrack()
+    conductor.append(mido.MetaMessage("time_signature", numerator=4, denominator=4, time=0))
+    conductor.append(mido.MetaMessage("set_tempo", tempo=500_000, time=0))
+    conductor.append(mido.MetaMessage("time_signature", numerator=3, denominator=4, time=1920))
+    conductor.append(mido.MetaMessage("set_tempo", tempo=1_000_000, time=0))
+    conductor.append(mido.MetaMessage("end_of_track", time=1440))
+    mid.tracks.append(conductor)
+
+    seconds, bars = midi_timeline_metrics(mid)
+
+    assert seconds == 5.0
+    assert bars == 2.0

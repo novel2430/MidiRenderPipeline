@@ -45,6 +45,9 @@ LoadStats WorkerEngine::load(const std::string& sfz_path) {
     s.regions = api_.get_num_regions(synth_);
     s.preloaded_samples = api_.get_num_preloaded_samples(synth_);
     s.sfizz_bytes = api_.get_num_bytes64(synth_);
+    s.sample_resident_bytes = api_.get_offline_sample_resident_bytes64(synth_);
+    s.sample_peak_bytes = api_.get_offline_sample_resident_peak_bytes64(synth_);
+    s.full_resident_samples = api_.get_offline_full_resident_sample_count(synth_);
     return s;
 }
 
@@ -136,5 +139,8 @@ RenderStats WorkerEngine::render(const EventFile& evf, const std::string& output
     s.active_voices_after = api_.get_num_active_voices(synth_);
     s.tail_limit_hit = limit_hit;
     s.sfizz_bytes = api_.get_num_bytes64(synth_);
+    s.sample_resident_bytes = api_.get_offline_sample_resident_bytes64(synth_);
+    s.sample_peak_bytes = api_.get_offline_sample_resident_peak_bytes64(synth_);
+    s.full_resident_samples = api_.get_offline_full_resident_sample_count(synth_);
     return s;
 }

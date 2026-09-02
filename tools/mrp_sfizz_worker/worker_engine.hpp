@@ -20,6 +20,9 @@ struct LoadStats {
     int regions{};
     std::size_t preloaded_samples{};
     std::uint64_t sfizz_bytes{};
+    std::uint64_t sample_resident_bytes{};
+    std::uint64_t sample_peak_bytes{};
+    std::uint64_t full_resident_samples{};
 };
 
 struct RenderStats {
@@ -28,6 +31,9 @@ struct RenderStats {
     int active_voices_after{};
     bool tail_limit_hit{};
     std::uint64_t sfizz_bytes{};
+    std::uint64_t sample_resident_bytes{};
+    std::uint64_t sample_peak_bytes{};
+    std::uint64_t full_resident_samples{};
 };
 
 class WorkerEngine {

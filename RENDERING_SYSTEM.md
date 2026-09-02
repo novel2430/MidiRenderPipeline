@@ -156,7 +156,7 @@ Useful controls:
 --workers N          global simultaneous task budget (batch)
 --jobs N             same global budget for single-file render compatibility
 --sfz-workers N      cap simultaneous SFZ tasks
---sfz-resident-memory SIZE  resident SFZ RAM budget (default auto)
+--sfz-memory-budget SIZE  persistent SFZ worker working-set target (default auto)
 --gm-workers N       cap FluidSynth worker processes
 --fx-workers N       cap native LV2-chain tasks
 --mix-workers N      cap mix/export tasks
@@ -170,6 +170,19 @@ Useful controls:
 
 Backend caps may be larger than the global budget; the coordinator still never
 runs more physical tasks than the global budget at once.
+
+Batch performance is reported in three complementary units:
+
+- `songs/min`: completed songs per wall-clock minute;
+- `track× realtime`: completed source MIDI duration multiplied by the number of
+  rendered logical source tracks, divided by wall time;
+- `ms / track-bar`: wall-clock milliseconds divided by rendered source
+  track-bars. Bar-equivalents are integrated over the MIDI time-signature
+  timeline, so changing meter is handled directly and tempo does not distort the
+  structural unit. Derived stems that share a source track index are counted once.
+
+These are end-to-end coordinator metrics, so planning, synthesis, FX, mixing,
+cache hits, and scheduler overhead are all reflected in the measured wall time.
 
 ## Failure semantics
 
@@ -185,19 +198,20 @@ admission.
 
 The SFZ backend uses a `PersistentSfizzPool` keyed by the resolved SFZ asset and
 render settings. One resident entry owns one process, one Synth, and one loaded
-instrument for its lifetime. V1 allows one replica per key, so a second task for a
-busy instrument stays pending while unrelated resident instruments may still run.
+instrument for its lifetime. There is at most one worker per key, so a second task
+for a busy instrument stays pending while unrelated resident instruments may still run.
 
-Execution concurrency and residency are separate controls. `--sfz-workers` limits
-running SFZ tasks; `--sfz-resident-memory` limits retained instrument memory.
-Cold-load admission reserves memory before launching a worker and actual residency
-is then measured through sfizz's 64-bit allocation API. An explicit memory size is
-a hard limit. In the default `auto` mode the budget is a steady-state target: an
-unknown instrument whose first load exceeds its estimate is allowed to finish the
-already-admitted task, further cold-load admission is blocked by the over-budget
-state, and idle entries are trimmed LRU as tasks finish. The coordinator does not
-move a task into `inflight` until the pool can admit it from the information known
-at dispatch time.
+Execution concurrency and memory are separate controls. `--sfz-workers` limits
+running SFZ tasks; `--sfz-memory-budget` is the aggregate working-set target for
+persistent sfizz workers. MRP does not reserve a theoretical whole-instrument
+size. Instead, each worker reports its current sfizz-managed bytes after LOAD and
+after every RENDER. The pool records observed per-instrument worker peaks and
+positive task growth, uses those observations for later admission, and evicts only
+idle LRU workers when needed. A never-before-seen workload is admitted once so its
+real footprint can be learned; therefore the budget is intentionally a
+steady-state target rather than a hard allocation guarantee. The coordinator does
+not move a task into `inflight` until the pool can admit it from the observations
+available at dispatch time.
 
 Every render starts with offline-baseline restore and seed 0. Worker crashes,
 timeouts, protocol errors, or render failures invalidate that resident entry and

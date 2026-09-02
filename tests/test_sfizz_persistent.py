@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import mido
 
@@ -35,6 +36,51 @@ def _job(tmp_path: Path, name: str, sfz_name: str) -> RenderJob:
     return RenderJob(track, name, patch, midi, tmp_path / f"{name}.wav")
 
 
+def _load_info(
+    working_set: int, *, sample: int | None = None, full_samples: int = 1
+) -> persistent.WorkerLoadInfo:
+    sample_bytes = working_set if sample is None else sample
+    return persistent.WorkerLoadInfo(
+        milliseconds=1.0,
+        regions=1,
+        preloaded_samples=1,
+        sfizz_bytes=working_set,
+        sample_resident_bytes=sample_bytes,
+        sample_peak_bytes=sample_bytes,
+        full_resident_samples=full_samples,
+    )
+
+
+def _render_info(
+    loads: int,
+    working_set: int,
+    *,
+    sample: int | None = None,
+    sample_peak: int | None = None,
+    full_samples: int = 1,
+) -> persistent.WorkerRenderInfo:
+    sample_bytes = working_set if sample is None else sample
+    return persistent.WorkerRenderInfo(
+        milliseconds=1.0,
+        frames=64,
+        active_after=0,
+        tail_limit=False,
+        instrument_loads=loads,
+        sfizz_bytes=working_set,
+        sample_resident_bytes=sample_bytes,
+        sample_peak_bytes=sample_bytes if sample_peak is None else sample_peak,
+        full_resident_samples=full_samples,
+    )
+
+
+def _runtime(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        persistent,
+        "require_sfizz_runtime",
+        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
+    )
+
+
 def test_event_bridge_preserves_sfizz_channel_messages(tmp_path: Path):
     midi = tmp_path / "events.mid"
     _midi(midi, program=31)
@@ -48,7 +94,7 @@ def test_event_bridge_preserves_sfizz_channel_messages(tmp_path: Path):
     assert " note_on 60 90\n" in text
 
 
-def test_resident_pool_reuses_one_worker_for_same_instrument(monkeypatch, tmp_path: Path):
+def test_pool_reuses_one_worker_and_reports_new_reuse_semantics(monkeypatch, tmp_path: Path):
     created = []
 
     class FakeWorker:
@@ -59,20 +105,18 @@ def test_resident_pool_reuses_one_worker_for_same_instrument(monkeypatch, tmp_pa
 
         def load(self, sfz):
             self.loads += 1
-            return persistent.WorkerLoadInfo(1.0, 1, 1, 100)
+            return _load_info(80, sample=40)
 
         def render(self, events, output, *, seed, midi_seconds):
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(2.0, 64, 0, False, self.loads, 100)
+            return _render_info(
+                self.loads, 100, sample=60, sample_peak=60, full_samples=4
+            )
 
         def close(self, *, graceful=True):
             self.closed = True
 
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
-    )
+    _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
         max_workers=2,
@@ -91,16 +135,23 @@ def test_resident_pool_reuses_one_worker_for_same_instrument(monkeypatch, tmp_pa
     finally:
         pool.close()
 
-    assert first.cold_load is True
-    assert second.cold_load is False
+    assert first.worker_started is True
+    assert second.worker_started is False
+    assert first.working_set_bytes == 100
+    assert first.working_set_growth_bytes == 20
+    assert first.sample_resident_bytes == 60
+    assert first.full_resident_samples == 4
     assert len(created) == 1
-    assert created[0].loads == 1
     assert stats.tasks == 2
-    assert stats.cold_loads == 1
-    assert stats.warm_renders == 1
+    assert stats.worker_starts == 1
+    assert stats.worker_reuses == 1
+    assert stats.current_sample_resident_bytes == 60
+    assert stats.peak_sample_resident_bytes == 60
+    assert stats.full_resident_samples == 4
+    assert stats.max_observed_task_growth_bytes == 20
 
 
-def test_resident_budget_evicts_idle_lru_before_new_instrument(monkeypatch, tmp_path: Path):
+def test_unseen_worker_is_learned_then_idle_lru_is_trimmed(monkeypatch, tmp_path: Path):
     created = []
 
     class FakeWorker:
@@ -111,22 +162,18 @@ def test_resident_budget_evicts_idle_lru_before_new_instrument(monkeypatch, tmp_
 
         def load(self, sfz):
             self.loads += 1
-            return persistent.WorkerLoadInfo(1.0, 1, 1, 100)
+            return _load_info(100)
 
         def render(self, events, output, *, seed, midi_seconds):
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 100)
+            return _render_info(self.loads, 100)
 
         def close(self, *, graceful=True):
             self.closed = True
 
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
-    )
-    first_job = _job(tmp_path, "piano", "piano.sfz")
-    second_job = _job(tmp_path, "bass", "bass.sfz")
+    _runtime(monkeypatch, tmp_path)
+    piano = _job(tmp_path, "piano", "piano.sfz")
+    bass = _job(tmp_path, "bass", "bass.sfz")
     pool = persistent.PersistentSfizzPool(
         max_workers=2,
         blocksize=1024,
@@ -137,125 +184,84 @@ def test_resident_budget_evicts_idle_lru_before_new_instrument(monkeypatch, tmp_
         worker_factory=FakeWorker,
     )
     try:
-        pool.submit(first_job).result(timeout=2)
-        pool.submit(second_job).result(timeout=2)
+        pool.submit(piano).result(timeout=2)
+        # Bass has never been observed, so it is admitted once with no invented
+        # whole-instrument reservation. LOAD reveals the real footprint and the
+        # idle piano worker is then trimmed.
+        assert pool.can_accept(bass) is True
+        pool.submit(bass).result(timeout=2)
         stats = pool.stats()
     finally:
         pool.close()
 
-    assert len(created) == 2
     assert created[0].closed is True
-    assert stats.evictions == 1
-    assert stats.peak_resident_bytes == 100
+    assert stats.worker_evictions == 1
+    assert stats.current_working_set_bytes == 100
+    assert stats.peak_working_set_bytes == 200
 
 
-def test_auto_budget_allows_post_load_estimate_overshoot_then_trims(monkeypatch, tmp_path: Path):
-    import threading
-
-    first_started = threading.Event()
-    release_first = threading.Event()
-    created = []
-
+def test_explicit_budget_is_a_working_set_target_not_a_hard_unknown_load_limit(monkeypatch, tmp_path: Path):
     class FakeWorker:
         def __init__(self, **kwargs):
             self.loads = 0
-            self.closed = False
-            self.name = ""
-            created.append(self)
 
         def load(self, sfz):
             self.loads += 1
-            self.name = Path(sfz).name
-            resident = 80 if self.name == "piano.sfz" else 90
-            return persistent.WorkerLoadInfo(1.0, 1, 1, resident)
+            return _load_info(100)
 
         def render(self, events, output, *, seed, midi_seconds):
-            if self.name == "piano.sfz":
-                first_started.set()
-                assert release_first.wait(timeout=2)
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 80 if self.name == "piano.sfz" else 90)
-
-        def close(self, *, graceful=True):
-            self.closed = True
-
-    monkeypatch.setattr(persistent, "auto_resident_memory_budget", lambda: 150)
-    monkeypatch.setattr(persistent, "_UNKNOWN_INSTRUMENT_RESERVATION", 60)
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
-    )
-    first_job = _job(tmp_path, "piano", "piano.sfz")
-    second_job = _job(tmp_path, "bass", "bass.sfz")
-    pool = persistent.PersistentSfizzPool(
-        max_workers=2,
-        blocksize=1024,
-        samplerate=48_000,
-        quality=2,
-        polyphony=256,
-        memory_budget_bytes=None,
-        worker_factory=FakeWorker,
-    )
-    try:
-        first = pool.submit(first_job)
-        assert first_started.wait(timeout=2)
-        # 80 resident + 60 reserved was a legal admission, but the second
-        # instrument turns out to cost 90 after sfizz has already loaded it.
-        assert pool.can_accept(second_job) is True
-        second = pool.submit(second_job)
-        result = second.result(timeout=2)
-        stats = pool.stats()
-
-        assert result.cold_load is True
-        assert stats.peak_resident_bytes == 170
-        assert stats.current_resident_bytes == 80
-        assert stats.evictions == 1
-        assert stats.worker_failures == 0
-        assert created[1].closed is True
-
-        release_first.set()
-        first.result(timeout=2)
-    finally:
-        release_first.set()
-        pool.close()
-
-
-def test_explicit_budget_remains_hard_after_unknown_load(monkeypatch, tmp_path: Path):
-    import threading
-
-    first_started = threading.Event()
-    release_first = threading.Event()
-
-    class FakeWorker:
-        def __init__(self, **kwargs):
-            self.loads = 0
-            self.name = ""
-
-        def load(self, sfz):
-            self.loads += 1
-            self.name = Path(sfz).name
-            resident = 80 if self.name == "piano.sfz" else 90
-            return persistent.WorkerLoadInfo(1.0, 1, 1, resident)
-
-        def render(self, events, output, *, seed, midi_seconds):
-            if self.name == "piano.sfz":
-                first_started.set()
-                assert release_first.wait(timeout=2)
-            output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 80 if self.name == "piano.sfz" else 90)
+            return _render_info(self.loads, 120)
 
         def close(self, *, graceful=True):
             pass
 
-    monkeypatch.setattr(persistent, "_UNKNOWN_INSTRUMENT_RESERVATION", 60)
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
+    _runtime(monkeypatch, tmp_path)
+    job = _job(tmp_path, "piano", "piano.sfz")
+    pool = persistent.PersistentSfizzPool(
+        max_workers=1,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+        memory_budget_bytes=50,
+        worker_factory=FakeWorker,
     )
-    first_job = _job(tmp_path, "piano", "piano.sfz")
-    second_job = _job(tmp_path, "bass", "bass.sfz")
+    try:
+        result = pool.submit(job).result(timeout=2)
+        stats = pool.stats()
+    finally:
+        pool.close()
+
+    assert result.worker_started is True
+    assert result.working_set_bytes == 120
+    assert stats.current_working_set_bytes == 120
+    assert stats.worker_failures == 0
+
+
+def test_observed_worker_peak_guides_recreated_worker_admission(monkeypatch, tmp_path: Path):
+    created = []
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            self.loads = 0
+            self.closed = False
+            created.append(self)
+
+        def load(self, sfz):
+            self.loads += 1
+            return _load_info(100)
+
+        def render(self, events, output, *, seed, midi_seconds):
+            output.write_bytes(b"wav")
+            return _render_info(self.loads, 100)
+
+        def close(self, *, graceful=True):
+            self.closed = True
+
+    _runtime(monkeypatch, tmp_path)
+    piano = _job(tmp_path, "piano", "piano.sfz")
+    bass = _job(tmp_path, "bass", "bass.sfz")
     pool = persistent.PersistentSfizzPool(
         max_workers=2,
         blocksize=1024,
@@ -266,26 +272,80 @@ def test_explicit_budget_remains_hard_after_unknown_load(monkeypatch, tmp_path: 
         worker_factory=FakeWorker,
     )
     try:
-        first = pool.submit(first_job)
-        assert first_started.wait(timeout=2)
-        assert pool.can_accept(second_job) is True
-        second = pool.submit(second_job)
-        try:
-            second.result(timeout=2)
-        except RuntimeError as exc:
-            assert "exceeds resident memory admission after load" in str(exc)
-        else:
-            raise AssertionError("explicit resident memory budget must remain hard")
-        release_first.set()
-        first.result(timeout=2)
+        pool.submit(piano).result(timeout=2)
+        pool.submit(bass).result(timeout=2)  # evicts piano after learning bass
+        assert created[0].closed is True
+        pool.submit(piano).result(timeout=2)  # known 100-byte peak evicts bass before restart
+        stats = pool.stats()
     finally:
-        release_first.set()
+        pool.close()
+
+    assert created[1].closed is True
+    assert stats.worker_starts == 3
+    assert stats.worker_evictions == 2
+    assert stats.current_working_set_bytes == 100
+
+
+def test_observed_task_growth_can_throttle_while_another_worker_is_busy(monkeypatch, tmp_path: Path):
+    bass_started = threading.Event()
+    release_bass = threading.Event()
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            self.loads = 0
+            self.name = ""
+            self.renders = 0
+
+        def load(self, sfz):
+            self.loads += 1
+            self.name = Path(sfz).name
+            return _load_info(50 if self.name == "piano.sfz" else 100)
+
+        def render(self, events, output, *, seed, midi_seconds):
+            self.renders += 1
+            if self.name == "bass.sfz" and self.renders == 2:
+                bass_started.set()
+                assert release_bass.wait(timeout=2)
+            output.write_bytes(b"wav")
+            if self.name == "piano.sfz":
+                return _render_info(self.loads, 100)  # learns +50 task growth
+            return _render_info(self.loads, 100)
+
+        def close(self, *, graceful=True):
+            pass
+
+    _runtime(monkeypatch, tmp_path)
+    piano = _job(tmp_path, "piano", "piano.sfz")
+    bass = _job(tmp_path, "bass", "bass.sfz")
+    pool = persistent.PersistentSfizzPool(
+        max_workers=2,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+        memory_budget_bytes=220,
+        worker_factory=FakeWorker,
+    )
+    try:
+        pool.submit(piano).result(timeout=2)
+        pool.submit(bass).result(timeout=2)
+        bass_future = pool.submit(bass)
+        assert bass_started.wait(timeout=2)
+        # Current observed workers are 200 and piano previously grew by 50.
+        # With bass busy there is no safe idle victim, so the known growth
+        # estimate delays piano instead of pretending memory is free.
+        assert pool.can_accept(piano) is False
+        release_bass.set()
+        bass_future.result(timeout=2)
+        assert pool.can_accept(piano) is True
+    finally:
+        release_bass.set()
         pool.close()
 
 
-def test_busy_instrument_has_no_replica_in_v1(monkeypatch, tmp_path: Path):
-    started = __import__("threading").Event()
-    release = __import__("threading").Event()
+def test_busy_instrument_has_no_replica(monkeypatch, tmp_path: Path):
+    started = threading.Event()
+    release = threading.Event()
 
     class FakeWorker:
         def __init__(self, **kwargs):
@@ -293,22 +353,18 @@ def test_busy_instrument_has_no_replica_in_v1(monkeypatch, tmp_path: Path):
 
         def load(self, sfz):
             self.loads += 1
-            return persistent.WorkerLoadInfo(1.0, 1, 1, 100)
+            return _load_info(100)
 
         def render(self, events, output, *, seed, midi_seconds):
             started.set()
             assert release.wait(timeout=2)
             output.write_bytes(b"wav")
-            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads, 100)
+            return _render_info(self.loads, 100)
 
         def close(self, *, graceful=True):
             pass
 
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
-    )
+    _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
         max_workers=2,
@@ -316,7 +372,7 @@ def test_busy_instrument_has_no_replica_in_v1(monkeypatch, tmp_path: Path):
         samplerate=48_000,
         quality=2,
         polyphony=256,
-        memory_budget_bytes=8 * 1024 ** 3,
+        memory_budget_bytes=8 * 1024**3,
         worker_factory=FakeWorker,
     )
     try:
@@ -341,7 +397,7 @@ def test_worker_failure_invalidates_entry_and_removes_partial_output(monkeypatch
 
         def load(self, sfz):
             self.loads += 1
-            return persistent.WorkerLoadInfo(1.0, 1, 1, 100)
+            return _load_info(100)
 
         def render(self, events, output, *, seed, midi_seconds):
             output.write_bytes(b"partial")
@@ -350,11 +406,7 @@ def test_worker_failure_invalidates_entry_and_removes_partial_output(monkeypatch
         def close(self, *, graceful=True):
             self.closed = True
 
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
-    )
+    _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
         max_workers=1,
@@ -375,7 +427,7 @@ def test_worker_failure_invalidates_entry_and_removes_partial_output(monkeypatch
         stats = pool.stats()
         assert job.output.exists() is False
         assert stats.worker_failures == 1
-        assert stats.current_resident_bytes == 0
+        assert stats.current_working_set_bytes == 0
         assert created[0].closed is True
     finally:
         pool.close()
@@ -402,70 +454,15 @@ def test_renderer_identity_is_portable_across_install_paths(tmp_path: Path):
         path.write_bytes(data)
     left_worker.chmod(0o755)
     right_worker.chmod(0o755)
-
-    # Different metadata/path locations must not change cache identity when the
-    # actual renderer bytes and renderer contract are identical.
     right_worker.touch()
     right_lib.touch()
 
-    left_identity = persistent.sfizz_renderer_identity(
-        worker=left_worker, library=left_lib
-    )
-    right_identity = persistent.sfizz_renderer_identity(
-        worker=right_worker, library=right_lib
-    )
+    left_identity = persistent.sfizz_renderer_identity(worker=left_worker, library=left_lib)
+    right_identity = persistent.sfizz_renderer_identity(worker=right_worker, library=right_lib)
 
     assert left_identity == right_identity
+    assert left_identity["worker_protocol"] == 5
+    assert left_identity["offline_api"] == 3
+    assert left_identity["sample_loading"] == "deterministic-lazy"
     assert "path" not in left_identity["worker"]
     assert "mtime_ns" not in left_identity["worker"]
-
-
-def test_resident_accounting_grows_after_lazy_first_touch(monkeypatch, tmp_path: Path):
-    class FakeWorker:
-        def __init__(self, **kwargs):
-            self.loads = 0
-            self.renders = 0
-
-        def load(self, sfz):
-            self.loads += 1
-            return persistent.WorkerLoadInfo(1.0, 1, 1, 100)
-
-        def render(self, events, output, *, seed, midi_seconds):
-            self.renders += 1
-            output.write_bytes(b"wav")
-            resident = 240 if self.renders == 1 else 320
-            return persistent.WorkerRenderInfo(
-                1.0, 64, 0, False, self.loads, resident
-            )
-
-        def close(self, *, graceful=True):
-            pass
-
-    monkeypatch.setattr(
-        persistent,
-        "require_sfizz_runtime",
-        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
-    )
-    job = _job(tmp_path, "piano", "piano.sfz")
-    pool = persistent.PersistentSfizzPool(
-        max_workers=1,
-        blocksize=1024,
-        samplerate=48_000,
-        quality=2,
-        polyphony=256,
-        memory_budget_bytes=1000,
-        worker_factory=FakeWorker,
-    )
-    try:
-        first = pool.submit(job).result(timeout=2)
-        job.output.unlink()
-        assert first.resident_bytes == 240
-        assert pool.stats().current_resident_bytes == 240
-
-        second = pool.submit(job).result(timeout=2)
-        assert second.resident_bytes == 320
-        stats = pool.stats()
-        assert stats.current_resident_bytes == 320
-        assert stats.peak_resident_bytes == 320
-    finally:
-        pool.close()

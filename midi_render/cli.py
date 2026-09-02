@@ -26,6 +26,7 @@ from .midi import (
     make_note_filtered_midi,
     make_program_override_midi,
     make_split_midi,
+    midi_timeline_metrics,
     musical_tracks,
 )
 from .patches import Patch, PatchRegistry
@@ -456,7 +457,7 @@ def _render_settings_from_args(
         keep_work=bool(args.keep_work),
         active_songs=active_songs,
         max_fx_backlog=getattr(args, "max_fx_backlog", None),
-        sfz_resident_memory=getattr(args, "sfz_resident_memory", None),
+        sfz_memory_budget=getattr(args, "sfz_memory_budget", None),
         sfizz_worker=sfizz_worker,
         sfizz_library=sfizz_library,
     ).normalized()
@@ -781,6 +782,9 @@ def _build_song_plan(
             make_task(song_id, Stage.RAW, Backend.FLUIDSYNTH, stem_ids, tuple(gm_jobs))
         )
 
+    music_duration_seconds, music_bars = midi_timeline_metrics(mid)
+    rendered_track_count = len({stem.track_index for stem in stem_plans})
+
     return SongPlan(
         song_id=song_id,
         midi_path=midi_path,
@@ -795,6 +799,9 @@ def _build_song_plan(
         skipped=tuple(skipped),
         track_index=track_index,
         master=registry.master,
+        music_duration_seconds=music_duration_seconds,
+        music_bars=music_bars,
+        rendered_track_count=rendered_track_count,
     )
 
 
@@ -881,9 +888,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
             gm_workers=settings.gm_workers,
             fx_workers=int(settings.fx_workers or 1),
             mix_workers=settings.mix_workers,
-            sfz_resident_memory=(
-                "auto" if settings.sfz_resident_memory is None
-                else format_bytes(settings.sfz_resident_memory)
+            sfz_memory_budget=(
+                "auto" if settings.sfz_memory_budget is None
+                else format_bytes(settings.sfz_memory_budget)
             ),
             state_db=state.path,
             run_identity=run_identity,
@@ -937,6 +944,12 @@ def cmd_batch(args: argparse.Namespace) -> int:
 
         failed = [result for result in results if result.status != "DONE"]
         done = [result for result in results if result.status == "DONE"]
+        track_seconds = sum(
+            result.music_duration_seconds * result.rendered_track_count for result in done
+        )
+        track_bars = sum(
+            result.music_bars * result.rendered_track_count for result in done
+        )
         logger.batch_progress(
             total=len(files),
             done=len(done),
@@ -947,6 +960,8 @@ def cmd_batch(args: argparse.Namespace) -> int:
             pending_mix=0,
             inflight=0,
             cache_hits=getattr(coordinator, "cache_hits", 0),
+            track_seconds=track_seconds,
+            track_bars=track_bars,
             force=True,
         )
         logger.batch_summary(
@@ -955,6 +970,8 @@ def cmd_batch(args: argparse.Namespace) -> int:
             failed_now=len(failed) + len(planning_failures),
             skipped_done=skipped_done,
             skipped_failed=skipped_failed,
+            track_seconds=track_seconds,
+            track_bars=track_bars,
             sfz_stats=coordinator.sfz_stats(),
         )
         for result in failed[:20]:
@@ -972,11 +989,11 @@ def _add_render_engine_args(p: argparse.ArgumentParser, *, batch: bool = False) 
         p.add_argument("--jobs", type=int, default=5, help="global concurrent task budget")
     p.add_argument("--sfz-workers", type=int, help="maximum simultaneous SFZ tasks")
     p.add_argument(
-        "--sfz-resident-memory",
+        "--sfz-memory-budget",
         type=_parse_byte_size,
         default=None,
         metavar="SIZE",
-        help="resident SFZ RAM budget (e.g. 12GiB; default: auto)",
+        help="persistent SFZ worker working-set budget (e.g. 8GiB; default: auto)",
     )
     p.add_argument("--gm-workers", type=int, default=1, help="persistent FluidSynth worker processes")
     p.add_argument("--fx-workers", type=int, help="maximum simultaneous FX-chain tasks")

@@ -350,29 +350,31 @@ New logging controls:
 rendering events suitable for long corpus runs.
 
 
-## v0.5.0 persistent RAM-resident sfizz backend
+## v0.5.0 persistent deterministic-lazy sfizz backend
 
 The per-stem `sfizz_render` subprocess path has been replaced by an
 instrument-affine persistent sfizz pool backed by the pinned MRP sfizz fork. One
-worker process owns one loaded SFZ/Synth and reuses its RAM-resident samples across
-matching tasks. Each task begins from the fork's offline baseline with deterministic
-seed 0. Multiple worker processes may render concurrently, while V1 keeps at most
-one replica of any InstrumentKey.
+worker process owns one loaded SFZ/Synth. Samples are not forced into RAM as a
+whole instrument: normal preloads are retained and each sample is synchronously
+promoted to complete residency on first touch. Each task begins from the fork's
+offline baseline with deterministic seed 0. Multiple instrument workers may render
+concurrently, while one InstrumentKey still has at most one worker.
 
 Build the project-local worker with `make native-sfizz-worker` (or `make native`)
 and configure the forked library with `[paths].sfizz_library` or `MRP_LIBSFIZZ`.
 `pysfizz`/`sfizz_render` is no longer the production SFZ dependency.
 
-`--sfz-workers` remains the execution-concurrency cap. New
-`--sfz-resident-memory SIZE` controls the independent resident RAM budget; `auto`
-is the default. Actual instrument cost is recorded with a 64-bit sfizz allocation
-query. Explicit sizes remain hard limits. Auto mode treats its budget as a
-steady-state target so first-load estimate error does not fail a render after the
-memory has already been allocated; further cold-load admission pauses and idle
-workers are trimmed LRU as tasks finish. Running workers are never evicted. All
-resident processes terminate when the coordinator closes.
+`--sfz-workers` remains the execution-concurrency cap. `--sfz-memory-budget SIZE`
+controls the independent sfizz worker working-set target; `auto` is the default.
+The old fixed instrument-cost / unknown cold-load reservation model is removed.
+Workers report actual sfizz-managed memory plus sample-residency statistics after
+LOAD and RENDER. MRP retains observed worker peaks and task growth as admission
+estimates, admits previously unseen work once to learn its footprint, and trims
+only idle LRU workers when the observed working set is above target. Running
+workers are never evicted. All persistent processes terminate when the coordinator
+closes.
 
-Raw SFZ cache identity moves to `raw-sfz-v3` and includes the persistent renderer
-contract, deterministic task seed, worker protocol/API version, and binary
-identities of the worker and libsfizz when available. Old `sfizz_render` raw cache
-entries are therefore not reused accidentally.
+Raw SFZ cache identity remains content-addressed and includes the persistent
+renderer contract, deterministic task seed, worker protocol/API version, sample
+loading policy, and binary identities of the worker and libsfizz when available.
+Old renderer contracts are therefore not reused accidentally.

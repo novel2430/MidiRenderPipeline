@@ -62,7 +62,7 @@ class RenderSettings:
     keep_work: bool = False
     active_songs: int = 32
     max_fx_backlog: int | None = None
-    sfz_resident_memory: int | None = None
+    sfz_memory_budget: int | None = None
     sfizz_worker: Path | None = None
     sfizz_library: Path | None = None
 
@@ -83,8 +83,8 @@ class RenderSettings:
             backlog = max(self.workers * 2, 4)
         if backlog < 1:
             raise ValueError("max_fx_backlog must be >= 1")
-        if self.sfz_resident_memory is not None and self.sfz_resident_memory < 1:
-            raise ValueError("sfz_resident_memory must be >= 1")
+        if self.sfz_memory_budget is not None and self.sfz_memory_budget < 1:
+            raise ValueError("sfz_memory_budget must be >= 1")
         return RenderSettings(
             workers=self.workers,
             sfz_workers=sfz,
@@ -100,7 +100,7 @@ class RenderSettings:
             keep_work=self.keep_work,
             active_songs=self.active_songs,
             max_fx_backlog=backlog,
-            sfz_resident_memory=self.sfz_resident_memory,
+            sfz_memory_budget=self.sfz_memory_budget,
             sfizz_worker=self.sfizz_worker,
             sfizz_library=self.sfizz_library,
         )
@@ -141,6 +141,9 @@ class SongPlan:
     skipped: tuple[tuple[int, str, str], ...] = ()
     track_index: int | None = None
     master: MasterConfig = field(default_factory=MasterConfig)
+    music_duration_seconds: float = 0.0
+    music_bars: float = 0.0
+    rendered_track_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -152,6 +155,9 @@ class SongResult:
     stats: dict[str, float] | None = None
     error: str | None = None
     elapsed_seconds: float = 0.0
+    music_duration_seconds: float = 0.0
+    music_bars: float = 0.0
+    rendered_track_count: int = 0
 
 
 def make_song_id(midi_path: Path, output: Path, run_identity: str = "") -> str:
@@ -458,7 +464,7 @@ class RenderingCoordinator:
             samplerate=self.settings.samplerate,
             quality=self.settings.quality,
             polyphony=self.settings.polyphony,
-            memory_budget_bytes=self.settings.sfz_resident_memory,
+            memory_budget_bytes=self.settings.sfz_memory_budget,
             worker_path=self.settings.sfizz_worker,
             library_path=self.settings.sfizz_library,
         )
@@ -714,13 +720,17 @@ class RenderingCoordinator:
                 value = [execution.stem]
                 diagnostics = execution.diagnostics
                 if self.logger is not None and self.logger.verbose:
-                    state = "cold" if execution.cold_load else "warm"
+                    state = "NEW" if execution.worker_started else "REUSE"
+                    growth = execution.working_set_growth_bytes / (1024 ** 2)
                     self.logger.scheduler(
                         f"sfz {state} · {execution.stem.patch.name} · "
-                        f"resident={execution.resident_bytes / (1024 ** 3):.2f}GiB",
+                        f"working-set={execution.working_set_bytes / (1024 ** 3):.2f}GiB · "
+                        f"growth=+{growth:.0f}MiB",
                         backend="sfz",
-                        resident_bytes=execution.resident_bytes,
-                        cold_load=execution.cold_load,
+                        working_set_bytes=execution.working_set_bytes,
+                        working_set_growth_bytes=execution.working_set_growth_bytes,
+                        sample_resident_bytes=execution.sample_resident_bytes,
+                        worker_started=execution.worker_started,
                     )
             else:
                 value = execution
@@ -778,6 +788,9 @@ class RenderingCoordinator:
                 status="DONE",
                 stats=value,
                 elapsed_seconds=elapsed,
+                music_duration_seconds=runtime.plan.music_duration_seconds,
+                music_bars=runtime.plan.music_bars,
+                rendered_track_count=runtime.plan.rendered_track_count,
             )
             self.results.append(result)
             if self.state is not None:
@@ -821,8 +834,15 @@ class RenderingCoordinator:
     def _emit_progress(self, *, force: bool = False) -> None:
         if self.logger is None or not self.logger.batch_mode or self.total_songs is None:
             return
-        done = sum(1 for result in self.results if result.status == "DONE")
+        completed = [result for result in self.results if result.status == "DONE"]
+        done = len(completed)
         failed = sum(1 for result in self.results if result.status != "DONE")
+        track_seconds = sum(
+            result.music_duration_seconds * result.rendered_track_count for result in completed
+        )
+        track_bars = sum(
+            result.music_bars * result.rendered_track_count for result in completed
+        )
         self.logger.batch_progress(
             total=self.total_songs,
             done=done,
@@ -833,6 +853,8 @@ class RenderingCoordinator:
             pending_mix=len(self.pending_mix),
             inflight=len(self.inflight),
             cache_hits=self.cache_hits,
+            track_seconds=track_seconds,
+            track_bars=track_bars,
             force=force,
         )
 
@@ -849,6 +871,9 @@ class RenderingCoordinator:
                 status="FAILED",
                 error=error,
                 elapsed_seconds=time.perf_counter() - runtime.started_at,
+                music_duration_seconds=runtime.plan.music_duration_seconds,
+                music_bars=runtime.plan.music_bars,
+                rendered_track_count=runtime.plan.rendered_track_count,
             )
         )
         if self.state is not None:

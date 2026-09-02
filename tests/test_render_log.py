@@ -80,3 +80,52 @@ def test_debug_shows_backend_diagnostics_but_normal_hides_them(tmp_path: Path):
     )
     logger.close()
     assert "ALSA warning" in debug.getvalue()
+
+
+def test_batch_summary_reports_normalized_performance_and_peak_memory_only():
+    from types import SimpleNamespace
+
+    stream = _Pipe()
+    logger = RenderLogger(LogOptions(mode="batch", color="never"), stream=stream)
+    logger._started = 100.0
+
+    import midi_render.render_log as render_log
+    original = render_log.time.perf_counter
+    render_log.time.perf_counter = lambda: 110.0
+    try:
+        stats = SimpleNamespace(
+            tasks=10,
+            worker_starts=2,
+            worker_reuses=8,
+            worker_evictions=1,
+            worker_failures=0,
+            current_working_set_bytes=0,
+            peak_working_set_bytes=2 * 1024 ** 3,
+            current_sample_resident_bytes=0,
+            peak_sample_resident_bytes=int(1.8 * 1024 ** 3),
+            full_resident_samples=0,
+            memory_budget_bytes=4 * 1024 ** 3,
+            max_observed_task_growth_bytes=256 * 1024 ** 2,
+        )
+        logger.batch_summary(
+            total=2,
+            completed_now=2,
+            failed_now=0,
+            skipped_done=0,
+            skipped_failed=0,
+            track_seconds=100.0,
+            track_bars=500.0,
+            sfz_stats=stats,
+        )
+    finally:
+        render_log.time.perf_counter = original
+        logger.close()
+
+    text = stream.getvalue()
+    assert "songs/min          12.00" in text
+    assert "track× realtime    10.0×" in text
+    assert "ms / track-bar     20.0 ms" in text
+    assert "peak working set" in text
+    assert "peak sample payload" in text
+    assert "current working set" not in text
+    assert "full samples" not in text

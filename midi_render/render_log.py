@@ -144,6 +144,19 @@ class RenderLogger:
             self.stream.flush()
             self._status_open = False
 
+    def _batch_rates(
+        self,
+        *,
+        done: int,
+        track_seconds: float,
+        track_bars: float,
+    ) -> tuple[float, float, float]:
+        elapsed = max(time.perf_counter() - self._started, 1e-9)
+        songs_per_minute = done / elapsed * 60.0
+        track_realtime = track_seconds / elapsed if track_seconds > 0 else 0.0
+        ms_per_track_bar = elapsed * 1000.0 / track_bars if track_bars > 0 else 0.0
+        return songs_per_minute, track_realtime, ms_per_track_bar
+
     def single_header(self, midi: Path, output: Path, *, track_index: int | None = None, stems: int | None = None) -> None:
         title = midi.stem
         suffix = f" · track {track_index:02d}" if track_index is not None else ""
@@ -162,7 +175,7 @@ class RenderLogger:
         gm_workers: int,
         fx_workers: int,
         mix_workers: int,
-        sfz_resident_memory: str,
+        sfz_memory_budget: str,
         state_db: Path,
         run_identity: str,
     ) -> None:
@@ -175,7 +188,7 @@ class RenderLogger:
                     "muted",
                 )
             )
-            self._line(self._style(f"  SFZ resident RAM: {sfz_resident_memory}", "muted"))
+            self._line(self._style(f"  SFZ memory budget: {sfz_memory_budget}", "muted"))
             self._line(self._style(f"  state: {state_db}", "muted"))
             self._line(self._style(f"  run:   {run_identity}", "muted"))
         self._event(
@@ -184,7 +197,7 @@ class RenderLogger:
             active_songs=active_songs,
             workers=workers,
             backend_caps={"sfz": sfz_workers, "gm": gm_workers, "fx": fx_workers, "mix": mix_workers},
-            sfz_resident_memory=sfz_resident_memory,
+            sfz_memory_budget=sfz_memory_budget,
             state_db=str(state_db),
             run_identity=run_identity,
         )
@@ -317,22 +330,30 @@ class RenderLogger:
         pending_mix: int,
         inflight: int,
         cache_hits: int,
+        track_seconds: float = 0.0,
+        track_bars: float = 0.0,
         force: bool = False,
     ) -> None:
         now = time.monotonic()
         if not force and now - self._last_heartbeat < self.options.heartbeat_seconds:
             return
         self._last_heartbeat = now
-        elapsed = max(time.perf_counter() - self._started, 1e-9)
         display_done = done + self._skipped_done
         display_failed = failed + self._skipped_failed
         completed = display_done + display_failed
-        rate = done / elapsed * 60.0
+        rate, track_realtime, ms_per_track_bar = self._batch_rates(
+            done=done, track_seconds=track_seconds, track_bars=track_bars
+        )
         pct = (100.0 * completed / total) if total else 100.0
+        performance = f"{rate:.2f} songs/min"
+        if track_realtime > 0:
+            performance += f" · {track_realtime:.1f}× track-RT"
+        if ms_per_track_bar > 0:
+            performance += f" · {ms_per_track_bar:.1f} ms/trk-bar"
         line = (
             f"{completed:,}/{total:,} {pct:5.1f}% · active {active} · "
             f"raw {pending_raw} · fx {pending_fx} · mix {pending_mix} · run {inflight} · "
-            f"cache {cache_hits} · fail {display_failed} · {rate:.2f} songs/min"
+            f"cache {cache_hits} · fail {display_failed} · {performance}"
         )
         self._event(
             "batch_progress",
@@ -346,6 +367,10 @@ class RenderLogger:
             inflight=inflight,
             cache_hits=cache_hits,
             songs_per_minute=rate,
+            track_realtime=track_realtime,
+            ms_per_track_bar=ms_per_track_bar,
+            track_seconds=track_seconds,
+            track_bars=track_bars,
         )
         if getattr(self.stream, "isatty", lambda: False)():
             self.stream.write("\r\x1b[2K" + self._style(line, "muted"))
@@ -363,9 +388,14 @@ class RenderLogger:
         failed_now: int,
         skipped_done: int,
         skipped_failed: int,
+        track_seconds: float = 0.0,
+        track_bars: float = 0.0,
         sfz_stats: Any | None = None,
     ) -> None:
         self.finish_status()
+        songs_per_minute, track_realtime, ms_per_track_bar = self._batch_rates(
+            done=completed_now, track_seconds=track_seconds, track_bars=track_bars
+        )
         self._event(
             "batch_summary",
             total=total,
@@ -373,15 +403,25 @@ class RenderLogger:
             failed_now=failed_now,
             skipped_done=skipped_done,
             skipped_failed=skipped_failed,
+            songs_per_minute=songs_per_minute,
+            track_realtime=track_realtime,
+            ms_per_track_bar=ms_per_track_bar,
+            track_seconds=track_seconds,
+            track_bars=track_bars,
             sfz_stats=(
                 None if sfz_stats is None else {
                     "tasks": sfz_stats.tasks,
-                    "cold_loads": sfz_stats.cold_loads,
-                    "warm_renders": sfz_stats.warm_renders,
-                    "evictions": sfz_stats.evictions,
+                    "worker_starts": sfz_stats.worker_starts,
+                    "worker_reuses": sfz_stats.worker_reuses,
+                    "worker_evictions": sfz_stats.worker_evictions,
                     "worker_failures": sfz_stats.worker_failures,
-                    "peak_resident_bytes": sfz_stats.peak_resident_bytes,
+                    "current_working_set_bytes": sfz_stats.current_working_set_bytes,
+                    "peak_working_set_bytes": sfz_stats.peak_working_set_bytes,
+                    "current_sample_resident_bytes": sfz_stats.current_sample_resident_bytes,
+                    "peak_sample_resident_bytes": sfz_stats.peak_sample_resident_bytes,
+                    "full_resident_samples": sfz_stats.full_resident_samples,
                     "memory_budget_bytes": sfz_stats.memory_budget_bytes,
+                    "max_observed_task_growth_bytes": sfz_stats.max_observed_task_growth_bytes,
                 }
             ),
         )
@@ -392,16 +432,27 @@ class RenderLogger:
         self._line(f"  failed now      {failed_now:,}")
         self._line(f"  skipped DONE    {skipped_done:,}")
         self._line(f"  skipped FAILED  {skipped_failed:,}")
+        if completed_now:
+            self._line("  Performance")
+            self._line(f"    songs/min          {songs_per_minute:.2f}")
+            if track_realtime > 0:
+                self._line(f"    track× realtime    {track_realtime:.1f}×")
+            if ms_per_track_bar > 0:
+                self._line(f"    ms / track-bar     {ms_per_track_bar:.1f} ms")
         if sfz_stats is not None and sfz_stats.tasks:
-            hit_rate = 100.0 * sfz_stats.warm_renders / sfz_stats.tasks
-            self._line("  SFZ renderer")
-            self._line(f"    tasks           {sfz_stats.tasks:,}")
-            self._line(f"    cold loads      {sfz_stats.cold_loads:,}")
-            self._line(f"    warm renders    {sfz_stats.warm_renders:,}")
-            self._line(f"    warm hit rate   {hit_rate:.1f}%")
-            self._line(f"    peak resident   {sfz_stats.peak_resident_bytes / (1024 ** 3):.2f} GiB")
-            self._line(f"    evictions       {sfz_stats.evictions:,}")
-            self._line(f"    worker failures {sfz_stats.worker_failures:,}")
+            reuse_rate = 100.0 * sfz_stats.worker_reuses / sfz_stats.tasks
+            self._line("  SFZ workers")
+            self._line(f"    tasks             {sfz_stats.tasks:,}")
+            self._line(f"    starts            {sfz_stats.worker_starts:,}")
+            self._line(f"    reuses            {sfz_stats.worker_reuses:,}")
+            self._line(f"    reuse rate        {reuse_rate:.1f}%")
+            self._line(f"    worker evictions  {sfz_stats.worker_evictions:,}")
+            self._line(f"    worker failures   {sfz_stats.worker_failures:,}")
+            self._line("  SFZ memory")
+            self._line(f"    peak working set    {sfz_stats.peak_working_set_bytes / (1024 ** 3):.2f} GiB")
+            self._line(f"    peak sample payload {sfz_stats.peak_sample_resident_bytes / (1024 ** 3):.2f} GiB")
+            self._line(f"    budget              {sfz_stats.memory_budget_bytes / (1024 ** 3):.2f} GiB")
+            self._line(f"    max task growth      {sfz_stats.max_observed_task_growth_bytes / (1024 ** 2):.0f} MiB")
 
     def _stage_key(self, stage: str, backend: str) -> str:
         if stage == "fx":

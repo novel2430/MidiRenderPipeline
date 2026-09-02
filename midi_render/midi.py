@@ -214,6 +214,40 @@ def analyze_midi(path: Path) -> tuple[mido.MidiFile, list[TrackInfo]]:
     return mid, tracks
 
 
+def midi_timeline_metrics(mid: mido.MidiFile) -> tuple[float, float]:
+    """Return source MIDI duration in seconds and fractional musical bars.
+
+    Bars are integrated over the global time-signature timeline, so changing
+    meter is handled without coupling the structural metric to tempo. The
+    duration follows the global tempo map. These are normalization metrics for
+    renderer throughput; they deliberately describe the input MIDI timeline,
+    not backend-specific audio tails.
+    """
+    if mid.ticks_per_beat <= 0:
+        return 0.0, 0.0
+
+    tempo = 500_000
+    numerator = 4
+    denominator = 4
+    seconds = 0.0
+    bars = 0.0
+
+    for msg in mido.merge_tracks(mid.tracks):
+        delta_ticks = int(msg.time)
+        if delta_ticks:
+            seconds += mido.tick2second(delta_ticks, mid.ticks_per_beat, tempo)
+            ticks_per_bar = mid.ticks_per_beat * numerator * 4.0 / denominator
+            if ticks_per_bar > 0:
+                bars += delta_ticks / ticks_per_bar
+        if msg.type == "set_tempo":
+            tempo = msg.tempo
+        elif msg.type == "time_signature":
+            numerator = msg.numerator
+            denominator = msg.denominator
+
+    return seconds, bars
+
+
 def musical_tracks(tracks: Iterable[TrackInfo]) -> list[TrackInfo]:
     return [track for track in tracks if track.has_notes]
 

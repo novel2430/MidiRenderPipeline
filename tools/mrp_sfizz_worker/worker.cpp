@@ -58,10 +58,10 @@ int main(int argc, char** argv) {
 
         SfizzDyn api(lib);
         const unsigned int offline_api = api.get_offline_render_api_version();
-        if (offline_api < 2)
+        if (offline_api < 3)
             throw std::runtime_error("libsfizz offline render API version is unsupported");
         WorkerEngine engine(api, cfg);
-        std::cout << "READY\tprotocol=4\tsample_rate=" << cfg.sample_rate
+        std::cout << "READY\tprotocol=5\tsample_rate=" << cfg.sample_rate
                   << "\tblock_size=" << cfg.block_size << "\tpolyphony=" << cfg.polyphony
                   << "\tquality=" << cfg.quality << "\toffline_api=" << offline_api
                   << "\tsample_loading=" << static_cast<int>(cfg.sample_loading) << std::endl;
@@ -76,7 +76,9 @@ int main(int argc, char** argv) {
                     auto s = engine.load(p[1]);
                     std::cout << std::fixed << std::setprecision(3)
                               << "OK\tLOAD\tms=" << s.milliseconds << "\tregions=" << s.regions
-                              << "\tpreloaded_samples=" << s.preloaded_samples << "\tsfizz_bytes=" << s.sfizz_bytes << std::endl;
+                              << "\tpreloaded_samples=" << s.preloaded_samples << "\tsfizz_bytes=" << s.sfizz_bytes
+                              << "\tsample_bytes=" << s.sample_resident_bytes << "\tsample_peak_bytes=" << s.sample_peak_bytes
+                              << "\tfull_resident_samples=" << s.full_resident_samples << std::endl;
                 } else if (p[0] == "RENDER") {
                     if (p.size() != 4)
                         throw std::runtime_error("RENDER expects: RENDER<TAB>events<TAB>wav<TAB>seed");
@@ -87,7 +89,9 @@ int main(int argc, char** argv) {
                               << "OK\tRENDER\tms=" << s.milliseconds << "\tframes=" << s.frames
                               << "\tactive_after=" << s.active_voices_after << "\ttail_limit=" << (s.tail_limit_hit ? 1 : 0)
                               << "\tinstrument_loads=" << engine.instrument_load_count()
-                              << "\tsfizz_bytes=" << s.sfizz_bytes << std::endl;
+                              << "\tsfizz_bytes=" << s.sfizz_bytes
+                              << "\tsample_bytes=" << s.sample_resident_bytes << "\tsample_peak_bytes=" << s.sample_peak_bytes
+                              << "\tfull_resident_samples=" << s.full_resident_samples << std::endl;
                 } else if (p[0] == "PING") {
                     std::cout << "OK\tPONG" << std::endl;
                 } else if (p[0] == "QUIT") {

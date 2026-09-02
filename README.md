@@ -215,22 +215,21 @@ Use `--retry-failed` to retry failed songs or `--force` to ignore persisted
 DONE/FAILED state. Batch outputs preserve the input directory tree below
 `--output-dir`.
 
-### Persistent SFZ residency
+### Persistent SFZ working set
 
-SFZ tasks use one resident process/Synth per instrument identity. A worker loads
-its SFZ and samples once, then executes matching RenderTasks serially with a fresh
-offline task baseline and deterministic seed. Different resident workers may run
-concurrently. V1 intentionally keeps at most one resident replica per instrument.
+SFZ tasks use one persistent process/Synth per instrument identity. The patched
+sfizz backend keeps normal sample preloads, then synchronously promotes a sample
+to full residency on first touch. This preserves deterministic offline output
+without decoding the whole instrument up front. Matching RenderTasks reuse the
+same worker serially; different instrument workers may run concurrently.
 
-`--sfz-workers` limits simultaneously executing SFZ tasks. RAM residency is a
-separate budget controlled by `--sfz-resident-memory SIZE` (for example `12GiB`).
-An explicit size is a hard admission limit. The default `auto` keeps an
-operating-system reserve and acts as a steady-state residency target: because the
-exact cost of a never-before-loaded instrument is only known after sfizz loads it,
-a first load may transiently exceed the estimate; MRP then stops further cold-load
-admission and trims idle least-recently-used workers back to budget as tasks
-finish. Running workers are never killed for admission. Worker processes live only
-for the current MRP run.
+`--sfz-workers` limits simultaneously executing SFZ tasks. `--sfz-memory-budget SIZE` controls the aggregate observed working-set target for persistent sfizz
+workers (for example `8GiB`). The budget is not a claim that an unseen task can be
+known exactly before it runs: MRP learns observed sfizz-managed high-water marks and task
+growth from completed renders, uses those observations for later admission, and
+trims idle least-recently-used workers when the observed working set exceeds the
+target. Busy workers are never killed. Worker processes live only for the current
+MRP run.
 
 ### Rendering logs
 
@@ -253,6 +252,15 @@ Three console levels are available:
 - default: compact task lines for a single song and a low-noise batch heartbeat;
 - `--verbose`: planning, cache, task start/done, scheduler details;
 - `--debug`: captured backend stdout/stderr in addition to verbose output.
+
+Batch progress and the final summary report three throughput views. `songs/min`
+is the human-friendly corpus rate. `track× realtime` divides completed source
+track-seconds by wall time, normalizing for both song duration and rendered track
+count. `ms / track-bar` divides wall time by completed rendered track-bars; bars
+follow the MIDI time-signature timeline, and derived stems such as the drum kick
+layer do not count as additional source tracks. The SFZ summary reports peak
+working-set/sample payload values rather than end-of-run current values, because
+persistent workers are closed before the final summary.
 
 For long experiments, `--log-file path.log` mirrors human-readable console events
 without ANSI escapes and `--json-log events.jsonl` records structured events for
@@ -388,7 +396,7 @@ full-song mix.
 If the raw stem does not exist yet, the selected track is rendered by the
 instrument-affine persistent sfizz pool and then cached for later tuning runs.
 Within one MRP run, the same SFZ stays RAM-resident and is reused across songs
-until the resident-memory budget evicts its idle worker. Use `--rebuild-raw` to ignore matching
+until the SFZ memory budget evicts its idle worker. Use `--rebuild-raw` to ignore matching
 raw cache files. In batch mode, combine `--force --rebuild-raw` when DONE songs
 must also be re-planned and re-synthesized. Cache files created under older raw
 cache schemas are intentionally not reused.

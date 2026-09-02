@@ -32,6 +32,9 @@ SfizzDyn::SfizzDyn(const std::string& path) {
     get_num_regions = require<sfizz_get_num_regions_fn>("sfizz_get_num_regions");
     get_num_preloaded_samples = require<sfizz_get_num_preloaded_samples_fn>("sfizz_get_num_preloaded_samples");
     get_num_bytes64 = require<sfizz_get_num_bytes64_fn>("sfizz_get_num_bytes64");
+    get_offline_sample_resident_bytes64 = require<sfizz_get_offline_sample_resident_bytes64_fn>("sfizz_get_offline_sample_resident_bytes64");
+    get_offline_sample_resident_peak_bytes64 = require<sfizz_get_offline_sample_resident_peak_bytes64_fn>("sfizz_get_offline_sample_resident_peak_bytes64");
+    get_offline_full_resident_sample_count = require<sfizz_get_offline_full_resident_sample_count_fn>("sfizz_get_offline_full_resident_sample_count");
 }
 
 SfizzDyn::~SfizzDyn() {
