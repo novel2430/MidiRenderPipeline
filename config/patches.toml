@@ -206,52 +206,52 @@ effects = []
 # those patches rely on source MIDI CC1 or the SFZ's own default controller state.
 [patches.string_ensemble]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-normal-mod-wheel-panned.sfz"
+sfz = "Strings/all-strings-SEC-normal-mod-wheel-panned.sfz"
 gain_db = -2.0
 
 [patches.choir]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Vocals/choir-MIXED-sustain.sfz"
+sfz = "Vocals/choir-MIXED-sustain.sfz"
 gain_db = 0.0
 
 [patches.flute]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Woodwinds/flute-SOLO-normal-mod-wheel.sfz"
+sfz = "Woodwinds/flute-SOLO-normal-mod-wheel.sfz"
 gain_db = 5.0
 
 [patches.solo_violin]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/1st-violin-SOLO-sustain.sfz"
+sfz = "Strings/1st-violin-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.solo_viola]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/viola-SOLO-sustain.sfz"
+sfz = "Strings/viola-SOLO-sustain.sfz"
 gain_db = -1.0
 
 [patches.harp]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/harp-sustain.sfz"
+sfz = "Strings/harp-sustain.sfz"
 gain_db = 0.0
 
 [patches.timpani]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Percussion/timpani-hit.sfz"
+sfz = "Percussion/timpani-hit.sfz"
 gain_db = 0.0
 
 [patches.vibraphone]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Percussion/vibraphone-open.sfz"
+sfz = "Percussion/vibraphone-open.sfz"
 gain_db = -1.0
 
 [patches.brass]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Brass/all-brass-SEC-sustain.sfz"
+sfz = "Brass/all-brass-SEC-sustain.sfz"
 gain_db = 0.0
 
 [patches.horn]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Brass/french-horn-SOLO-sustain.sfz"
+sfz = "Brass/french-horn-SOLO-sustain.sfz"
 gain_db = 0.0
 
 # Program-specific baked FreePats guitars. These contain their intended finished
@@ -279,62 +279,62 @@ effects = []
 # pipeline; normal-mod-wheel patches therefore consume only source/default CC1.
 [patches.cello]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/cello-SOLO-normal-mod-wheel.sfz"
+sfz = "Strings/cello-SOLO-normal-mod-wheel.sfz"
 gain_db = -10.0
 
 [patches.contrabass]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/bass-SOLO-sustain.sfz"
+sfz = "Strings/bass-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.string_tremolo]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-tremolo-panned.sfz"
+sfz = "Strings/all-strings-SEC-tremolo-panned.sfz"
 gain_db = 0.0
 
 [patches.string_pizzicato]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Strings/all-strings-SEC-pizzicato-panned.sfz"
+sfz = "Strings/all-strings-SEC-pizzicato-panned.sfz"
 gain_db = 0.0
 
 [patches.trumpet]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Brass/trumpet-SOLO-sustain.sfz"
+sfz = "Brass/trumpet-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.trombone]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Brass/trombone-SOLO-sustain.sfz"
+sfz = "Brass/trombone-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.tuba]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Brass/tuba-SOLO-sustain.sfz"
+sfz = "Brass/tuba-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.oboe]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Woodwinds/oboe-SOLO-sustain.sfz"
+sfz = "Woodwinds/oboe-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.english_horn]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Woodwinds/english-horn-SOLO-sustain.sfz"
+sfz = "Woodwinds/english-horn-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.bassoon]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Woodwinds/bassoon-SOLO-sustain.sfz"
+sfz = "Woodwinds/bassoon-SOLO-sustain.sfz"
 gain_db = 0.0
 
 [patches.clarinet]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Woodwinds/clarinet-SOLO-normal-mod-wheel.sfz"
+sfz = "Woodwinds/clarinet-SOLO-normal-mod-wheel.sfz"
 gain_db = 0.0
 
 [patches.piccolo]
 library = "vpo"
-sfz = "Virtual-Playing-Orchestra3/Woodwinds/piccolo-SOLO-sustain.sfz"
+sfz = "Woodwinds/piccolo-SOLO-sustain.sfz"
 gain_db = 0.0
 
 # A family/shared patch may intentionally cover several GM programs. Exact

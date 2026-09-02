@@ -26,7 +26,7 @@ SFIZZ_TASK_SEED = 0
 SFIZZ_RENDERER_CONTRACT = "mrp-persistent-sfizz-v1"
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
-_UNKNOWN_INSTRUMENT_RESERVATION = 4 * _GIB
+_UNKNOWN_INSTRUMENT_RESERVATION = 5 * _GIB
 _AUTO_TOTAL_FRACTION = 0.70
 _AUTO_OS_RESERVE = 1 * _GIB
 
@@ -655,6 +655,36 @@ class PersistentSfizzPool:
             return known
         return min(_UNKNOWN_INSTRUMENT_RESERVATION, self.memory_budget_bytes)
 
+    def _trim_idle_to_budget_locked(self) -> list[_ResidentEntry]:
+        """Evict idle LRU entries until the steady-state budget is satisfied.
+
+        Auto mode is deliberately a steady-state resident target rather than a
+        post-load failure boundary: the first load is the moment when sfizz can
+        report the actual resident size, so an admitted unknown instrument may
+        turn out larger than its reservation. Busy workers are never killed.
+        Once any worker becomes idle we trim back toward the budget. A single
+        instrument which is itself larger than the auto budget remains allowed,
+        matching the admission rule for sole oversized instruments.
+        """
+        current = self._resident_bytes_locked()
+        if current <= self.memory_budget_bytes:
+            return []
+        if self._auto_budget and len(self._entries) == 1:
+            return []
+
+        victims: list[_ResidentEntry] = []
+        for candidate in sorted(
+            (entry for entry in self._entries.values() if not entry.busy),
+            key=lambda item: item.last_used,
+        ):
+            self._entries.pop(candidate.key, None)
+            victims.append(candidate)
+            self._evictions += 1
+            current -= candidate.resident_bytes
+            if current <= self.memory_budget_bytes:
+                break
+        return victims
+
     def _eviction_plan_locked(self, key: InstrumentKey) -> list[InstrumentKey] | None:
         entry = self._entries.get(key)
         if entry is not None:
@@ -768,11 +798,15 @@ class PersistentSfizzPool:
             job.output.unlink(missing_ok=True)
             self._invalidate_entry(entry)
             raise
+        to_close: list[_ResidentEntry] = []
         with self._lock:
             current = self._entries.get(entry.key)
             if current is entry:
                 entry.busy = False
                 entry.last_used = time.monotonic()
+                to_close = self._trim_idle_to_budget_locked()
+        for victim in to_close:
+            victim.worker.close()
         return execution
 
     def _run_new(
@@ -818,7 +852,7 @@ class PersistentSfizzPool:
                         if current + load.sfizz_bytes <= self.memory_budget_bytes:
                             break
                 over_budget = current + load.sfizz_bytes > self.memory_budget_bytes
-                if over_budget and not (self._auto_budget and current == 0):
+                if over_budget and not self._auto_budget:
                     raise RuntimeError(
                         "SFZ instrument exceeds resident memory admission after load: "
                         f"instrument={format_bytes(load.sfizz_bytes)} "
@@ -878,11 +912,15 @@ class PersistentSfizzPool:
             raise
 
         assert entry is not None
+        to_close: list[_ResidentEntry] = []
         with self._lock:
             current = self._entries.get(key)
             if current is entry:
                 entry.busy = False
                 entry.last_used = time.monotonic()
+                to_close = self._trim_idle_to_budget_locked()
+        for victim in to_close:
+            victim.worker.close()
         return execution
 
     def _invalidate_entry(self, entry: _ResidentEntry) -> None:

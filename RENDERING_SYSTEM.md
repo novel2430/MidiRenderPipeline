@@ -190,10 +190,14 @@ busy instrument stays pending while unrelated resident instruments may still run
 
 Execution concurrency and residency are separate controls. `--sfz-workers` limits
 running SFZ tasks; `--sfz-resident-memory` limits retained instrument memory.
-Cold-load admission reserves memory before launching a worker, actual residency is
-then measured through sfizz's 64-bit allocation API, and idle entries are evicted
-least-recently-used when necessary. The coordinator does not move a task into
-`inflight` until the pool can actually admit it.
+Cold-load admission reserves memory before launching a worker and actual residency
+is then measured through sfizz's 64-bit allocation API. An explicit memory size is
+a hard limit. In the default `auto` mode the budget is a steady-state target: an
+unknown instrument whose first load exceeds its estimate is allowed to finish the
+already-admitted task, further cold-load admission is blocked by the over-budget
+state, and idle entries are trimmed LRU as tasks finish. The coordinator does not
+move a task into `inflight` until the pool can admit it from the information known
+at dispatch time.
 
 Every render starts with offline-baseline restore and seed 0. Worker crashes,
 timeouts, protocol errors, or render failures invalidate that resident entry and

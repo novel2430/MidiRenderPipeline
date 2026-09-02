@@ -149,6 +149,140 @@ def test_resident_budget_evicts_idle_lru_before_new_instrument(monkeypatch, tmp_
     assert stats.peak_resident_bytes == 100
 
 
+def test_auto_budget_allows_post_load_estimate_overshoot_then_trims(monkeypatch, tmp_path: Path):
+    import threading
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    created = []
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            self.loads = 0
+            self.closed = False
+            self.name = ""
+            created.append(self)
+
+        def load(self, sfz):
+            self.loads += 1
+            self.name = Path(sfz).name
+            resident = 80 if self.name == "piano.sfz" else 90
+            return persistent.WorkerLoadInfo(1.0, 1, 1, resident)
+
+        def render(self, events, output, *, seed, midi_seconds):
+            if self.name == "piano.sfz":
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            output.write_bytes(b"wav")
+            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads)
+
+        def close(self, *, graceful=True):
+            self.closed = True
+
+    monkeypatch.setattr(persistent, "auto_resident_memory_budget", lambda: 150)
+    monkeypatch.setattr(persistent, "_UNKNOWN_INSTRUMENT_RESERVATION", 60)
+    monkeypatch.setattr(
+        persistent,
+        "require_sfizz_runtime",
+        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
+    )
+    first_job = _job(tmp_path, "piano", "piano.sfz")
+    second_job = _job(tmp_path, "bass", "bass.sfz")
+    pool = persistent.PersistentSfizzPool(
+        max_workers=2,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+        memory_budget_bytes=None,
+        worker_factory=FakeWorker,
+    )
+    try:
+        first = pool.submit(first_job)
+        assert first_started.wait(timeout=2)
+        # 80 resident + 60 reserved was a legal admission, but the second
+        # instrument turns out to cost 90 after sfizz has already loaded it.
+        assert pool.can_accept(second_job) is True
+        second = pool.submit(second_job)
+        result = second.result(timeout=2)
+        stats = pool.stats()
+
+        assert result.cold_load is True
+        assert stats.peak_resident_bytes == 170
+        assert stats.current_resident_bytes == 80
+        assert stats.evictions == 1
+        assert stats.worker_failures == 0
+        assert created[1].closed is True
+
+        release_first.set()
+        first.result(timeout=2)
+    finally:
+        release_first.set()
+        pool.close()
+
+
+def test_explicit_budget_remains_hard_after_unknown_load(monkeypatch, tmp_path: Path):
+    import threading
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            self.loads = 0
+            self.name = ""
+
+        def load(self, sfz):
+            self.loads += 1
+            self.name = Path(sfz).name
+            resident = 80 if self.name == "piano.sfz" else 90
+            return persistent.WorkerLoadInfo(1.0, 1, 1, resident)
+
+        def render(self, events, output, *, seed, midi_seconds):
+            if self.name == "piano.sfz":
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            output.write_bytes(b"wav")
+            return persistent.WorkerRenderInfo(1.0, 64, 0, False, self.loads)
+
+        def close(self, *, graceful=True):
+            pass
+
+    monkeypatch.setattr(persistent, "_UNKNOWN_INSTRUMENT_RESERVATION", 60)
+    monkeypatch.setattr(
+        persistent,
+        "require_sfizz_runtime",
+        lambda **kwargs: (tmp_path / "worker", tmp_path / "libsfizz.so"),
+    )
+    first_job = _job(tmp_path, "piano", "piano.sfz")
+    second_job = _job(tmp_path, "bass", "bass.sfz")
+    pool = persistent.PersistentSfizzPool(
+        max_workers=2,
+        blocksize=1024,
+        samplerate=48_000,
+        quality=2,
+        polyphony=256,
+        memory_budget_bytes=150,
+        worker_factory=FakeWorker,
+    )
+    try:
+        first = pool.submit(first_job)
+        assert first_started.wait(timeout=2)
+        assert pool.can_accept(second_job) is True
+        second = pool.submit(second_job)
+        try:
+            second.result(timeout=2)
+        except RuntimeError as exc:
+            assert "exceeds resident memory admission after load" in str(exc)
+        else:
+            raise AssertionError("explicit resident memory budget must remain hard")
+        release_first.set()
+        first.result(timeout=2)
+    finally:
+        release_first.set()
+        pool.close()
+
+
 def test_busy_instrument_has_no_replica_in_v1(monkeypatch, tmp_path: Path):
     started = __import__("threading").Event()
     release = __import__("threading").Event()

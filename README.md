@@ -223,10 +223,14 @@ offline task baseline and deterministic seed. Different resident workers may run
 concurrently. V1 intentionally keeps at most one resident replica per instrument.
 
 `--sfz-workers` limits simultaneously executing SFZ tasks. RAM residency is a
-separate budget controlled by `--sfz-resident-memory SIZE` (for example `12GiB`);
-the default `auto` keeps an operating-system reserve. When the budget is full,
-only idle least-recently-used instrument workers are evicted. Running workers are
-never killed for admission. Worker processes live only for the current MRP run.
+separate budget controlled by `--sfz-resident-memory SIZE` (for example `12GiB`).
+An explicit size is a hard admission limit. The default `auto` keeps an
+operating-system reserve and acts as a steady-state residency target: because the
+exact cost of a never-before-loaded instrument is only known after sfizz loads it,
+a first load may transiently exceed the estimate; MRP then stops further cold-load
+admission and trims idle least-recently-used workers back to budget as tasks
+finish. Running workers are never killed for admission. Worker processes live only
+for the current MRP run.
 
 ### Rendering logs
 

@@ -366,8 +366,11 @@ and configure the forked library with `[paths].sfizz_library` or `MRP_LIBSFIZZ`.
 `--sfz-workers` remains the execution-concurrency cap. New
 `--sfz-resident-memory SIZE` controls the independent resident RAM budget; `auto`
 is the default. Actual instrument cost is recorded with a 64-bit sfizz allocation
-query. Idle workers are evicted LRU when necessary; running workers are never
-evicted. All resident processes terminate when the coordinator closes.
+query. Explicit sizes remain hard limits. Auto mode treats its budget as a
+steady-state target so first-load estimate error does not fail a render after the
+memory has already been allocated; further cold-load admission pauses and idle
+workers are trimmed LRU as tasks finish. Running workers are never evicted. All
+resident processes terminate when the coordinator closes.
 
 Raw SFZ cache identity moves to `raw-sfz-v3` and includes the persistent renderer
 contract, deterministic task seed, worker protocol/API version, and binary
