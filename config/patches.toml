@@ -7,7 +7,8 @@ fx = "../resources/fx"
 lv2 = "../resources/fx/lv2"
 tools = "../resources/tools"
 # Optional. If omitted, MRP_LIBSFIZZ/LIBSFIZZ and standard library paths are checked.
-# sfizz_library = "/home/novel2430/src/sfizz/install-mrp/lib64/libsfizz.so.1.2."
+# The current MRP sfizz fork is based on sfizz 1.2.3 and must expose offline API >= 3.
+# sfizz_library = "/path/to/libsfizz.so"
 
 # One native process handles a stem's complete LV2 chain in 1024-frame blocks.
 # Effects may still opt into backend = "lv2apply" individually as a legacy
@@ -166,12 +167,6 @@ library = "mdm_acoustic"
 sfz = "MDMAG Sustain Pick F.sfz"
 gain_db = -6.0
 
-# [patches.electric_bass]
-# library = "growlybass"
-# sfz = "growlybass_clean.sfz"
-# gain_db = -3.0
-# effects = ["gxsvt"]
-
 [patches.electric_bass]
 library = "fashionbass"
 sfz = "fashionbass_clean.sfz"
@@ -188,12 +183,6 @@ library = "fsbs_clean"
 sfz = "EGuitarFSBS-clean bridge 20260807.sfz"
 gain_db = -1.0
 effects = []
-# [patches.electric_guitar_clean]
-# library = "ui_standard_guitar"
-# sfz = "Programs/01-Standard Guitar KSOP.sfz"
-# gain_db = 5.0
-# effects = ["blueamp_clean", "ultracab_clean"]
-
 [patches.electric_guitar_drive]
 library = "fsbs_drive2"
 sfz = "EGuitarFSBS-dist2 bridge 20220911.sfz"

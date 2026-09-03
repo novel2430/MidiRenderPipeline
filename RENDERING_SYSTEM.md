@@ -1,13 +1,12 @@
 # Rendering System
 
-MidiRenderPipeline v0.5 uses the former one-song procedural pipeline into a
-bounded, resumable rendering system. The audio backends are still deliberately
-different internally, but they share one planning, task, scheduling, and state
-model.
+This document describes the **current MidiRenderPipeline 0.5.0 execution
+contract**. Historical implementation details belong in `MIGRATION.md`; this file
+is intentionally written as a present-tense architecture reference.
 
-## Core model
+## 1. Core model
 
-Planning is song-scoped; scheduling is stem-scoped.
+Planning is song-scoped and scheduling is stem-scoped.
 
 ```text
 MIDI
@@ -20,248 +19,369 @@ MIDI
 ```
 
 `StemPlan` is the logical unit. `RenderTask.stem_ids` is intentionally plural:
-a normal SFZ task produces one raw stem, while a FluidSynth task may pack
-several GM stems from the same song into one physical multi-output render.
-Batching therefore remains a backend optimization rather than leaking into the
-logical pipeline.
 
-## State transitions
+- a normal SFZ physical task produces one logical raw stem;
+- a FluidSynth physical task may pack several logical one-channel GM stems from
+  the same song into one multi-output render.
+
+Backend batching therefore remains an execution optimization and does not leak
+into the logical song model.
+
+## 2. State transitions
 
 ```text
 PLANNED
   -> RAW_PENDING
   -> RAW_READY
-  -> FX_PENDING       (only when the patch has effects)
+  -> FX_PENDING        only when the patch has effects
   -> PROCESSED_READY
   -> MIX_PENDING
   -> DONE
 ```
 
-Raw stems are the durable expensive-stage cache boundary. A restarted batch
-re-plans interrupted songs and reuses deterministic fingerprinted raw stems;
-FX and mix are reapplied so current downstream configuration remains visible.
+A stem without effects proceeds directly from `RAW_READY` to
+`PROCESSED_READY`.
 
-## Coordinator and executor pools
+Raw stems are the durable expensive-stage cache boundary. FX and mix are
+recomputed from cached RAW artifacts when downstream configuration changes.
 
-One long-running Python coordinator owns all scheduling state. It uses
-backend-specific executor pools but enforces one global worker budget across
-them.
+## 3. Coordinator and executor pools
 
-```text
-                         RenderingCoordinator
-                                |
-           +--------------------+--------------------+
-           |                    |                    |
-        SFZ pool             GM pool              FX pool
-  resident processes     Process workers       Thread workers
-           |                    |                    |
-   one Synth / SFZ        libfluidsynth        mrp-lv2-chain
-   RAM load once          embedded native       child process
-                                                    |
-                                               whole LV2 chain
-                                |
-                             MIX pool
-```
-
-Why the pools differ:
-
-- SFZ work uses instrument-affine resident worker processes. Each process owns
-  one Synth/SFZ and executes one task at a time. A warmed InstrumentKey may own
-  multiple independent replicas, so same-instrument tasks can run concurrently.
-- FluidSynth is embedded in Python, so GM work gets persistent process isolation.
-  The worker processes are long-lived; each physical GM task still creates the
-  synth/session required by the v0.3.14 native-file or multi-output fast path.
-- FX work is already isolated in `mrp-lv2-chain`, so threads supervise one native
-  process per effected stem.
-- Mix/export runs in a thread pool sized to the resolved resource policy.
-
-The global `--concurrency` budget is the coordinator's hard in-flight ceiling.
-Backend-specific capacities are AUTO by default and cannot multiply past that
-global budget; legacy `--workers` / `--jobs` spellings remain aliases.
-
-## Backpressure
-
-The scheduler prioritizes downstream completion:
+One long-running Python `RenderingCoordinator` owns scheduling state for both
+single-song and batch rendering.
 
 ```text
-MIX > FX > RAW
+                          RenderingCoordinator
+                                  |
+            +---------------------+--------------------+
+            |                     |                    |
+      persistent SFZ          GM process            FX thread
+          pool                  pool                  pool
+            |                     |                    |
+   mrp-sfizz-worker         libfluidsynth        mrp-lv2-chain
+   one Synth / worker      embedded native       one child/stem
+            |
+          RAM-resident SFZ                         MIX thread pool
 ```
 
-When queued/running FX reaches `--max-fx-backlog`, new raw work is temporarily
-withheld. Raw jobs already in flight are allowed to finish. This prevents a fast
-sampler stage from filling scratch storage with a large RAW_READY backlog while
-FX is the bottleneck.
+### SFZ
 
-## Bounded admission
+`PersistentSfizzPool` is instrument-affine. One resident worker process owns one
+Synth and one loaded SFZ and executes one task at a time.
 
-`midi-render batch` does not expand an entire dataset into millions of task
-objects. Only `--active-songs` plans are resident at a time. When one song
-finishes or fails, the next MIDI is admitted.
+An `InstrumentKey` includes the resolved SFZ asset identity plus block size,
+sample rate, quality, and polyphony. A key may own multiple independent worker
+replicas up to `--sfz-max-replicas`.
 
-For example, a 100,000-song corpus with `--active-songs 64` keeps roughly 64
-song plans live while preserving a single long-running set of executor pools.
+A cold key may start one worker. It must complete at least one render before the
+pool may scale that same key out, so replica admission can use an observed
+working-set footprint instead of guessing multiple unknown first-touch loads.
 
-## SQLite resume journal
+### FluidSynth
 
-Batch mode defaults to `renders/render-state.sqlite3`. The coordinator is the
-only database writer. It records song and physical-task state:
+GM work runs in persistent Python worker processes for process isolation. A
+physical task creates the FluidSynth synth/session it needs:
+
+- singleton/simple GM stem -> native file renderer;
+- 2..16 ordinary one-channel GM stems -> one multi-output synth/session;
+- source track with multiple MIDI channels -> native single-stem compatibility
+  render.
+
+FluidSynth internal `synth.cpu-cores` remains 1.
+
+### FX
+
+FX tasks are supervised by a thread pool. The project-native `mrp-lv2-chain`
+child process owns the complete ordered effect chain for one stem.
+
+### MIX
+
+Mix/export tasks use a thread pool. MIX is downstream of all required processed
+stems for the song.
+
+## 4. Global and backend concurrency
+
+`--concurrency` is the hard global in-flight task ceiling. Backend capacities
+cannot multiply beyond it.
+
+Default policy:
 
 ```text
-songs: song_id, midi_path, output_path, status, error, timestamps
-tasks: task_id, song_id, stage, backend, stem_ids, status, attempts, error
+SFZ = concurrency
+FX  = concurrency
+MIX = concurrency
+GM  = min(concurrency, min(4, max(1, concurrency // 4)))
 ```
 
-SQLite uses WAL mode. `DONE` songs with an existing final output are skipped on
-restart. `RUNNING` songs are simply re-planned; deterministic raw cache files
-allow them to resume after the expensive sampler stage when possible. `FAILED`
-songs are skipped unless `--retry-failed` is supplied.
-
-A batch run identity includes the patch-config contents, core render settings,
-and stat identities for configured SFZ/SF2 assets and the native FX helper. The
-song identity additionally includes a SHA-256 of the source MIDI, so editing a
-file in place cannot silently match an old DONE row. `--force` ignores
-DONE/FAILED state when an experiment deliberately needs to be rerun.
-
-Raw-stem cache keys are artifact-addressed at the symbolic renderer boundary:
-the final prepared MIDI file is hashed after velocity/controller/timing/split or
-program-remap processing. SFZ/GM cache lookup therefore tracks the bytes actually
-sent to the renderer instead of inferring them only from source/config metadata.
-`--rebuild-raw` bypasses those raw cache files; for already-DONE batch songs use
-it together with `--force`.
-
-## Commands
-
-Single-file rendering uses exactly the same coordinator with an active window
-of one:
-
-```bash
-midi-render render song.mid --concurrency 5
-```
-
-Long-running dataset rendering:
-
-```bash
-midi-render batch /data/midi \
-  --output-dir /data/rendered \
-  --work-root /scratch/mrp \
-  --state-db /scratch/mrp-state.sqlite3 \
-  --active-songs 64 \
-  --concurrency 32 \
-  --sfz-max-replicas 2
-```
-
-Primary resource controls:
-
-```text
---concurrency N       global simultaneous task budget
---active-songs N      bounded song planning/admission window
---sfz-max-replicas N  maximum resident replicas for one SFZ InstrumentKey
-```
-
-Normally those are the only concurrency knobs a user needs. The coordinator
-resolves backend capacity automatically: SFZ, FX, and MIX may use the full global
-budget, while GM/FluidSynth uses a conservative process fan-out that grows with
-`--concurrency` and currently tops out at four. The following remain advanced
-overrides and are not required for normal use:
+Advanced overrides:
 
 ```text
 --sfz-concurrency N
 --gm-concurrency N
 --fx-concurrency N
 --mix-concurrency N
---sfz-memory-budget SIZE
---max-fx-backlog N
 ```
 
-Legacy `--workers`, `--jobs`, and `--*-workers` spellings remain accepted as CLI
-aliases. Backend overrides are effective caps inside the global budget; specifying
-a value larger than `--concurrency` does not create additional execution slots.
+Each override is clamped to the global concurrency budget.
 
-Batch performance is reported in three complementary units:
-
-- `songs/min`: completed songs per wall-clock minute;
-- `track× realtime`: completed source MIDI duration multiplied by the number of
-  rendered logical source tracks, divided by wall time;
-- `ms / track-bar`: wall-clock milliseconds divided by rendered source
-  track-bars. Bar-equivalents are integrated over the MIDI time-signature
-  timeline, so changing meter is handled directly and tempo does not distort the
-  structural unit. Derived stems that share a source track index are counted once.
-
-These are end-to-end coordinator metrics, so planning, synthesis, FX, mixing,
-cache hits, and scheduler overhead are all reflected in the measured wall time.
-
-## Failure semantics
-
-A physical task failure marks its song FAILED and records the error. Other songs
-continue. Work already in flight for the failed song is allowed to return, but
-no new downstream work is scheduled for it. This avoids turning one malformed
-MIDI or plugin failure into a corpus-wide abort.
-
-Planning failures are also persisted per song and do not stop the rest of batch
-admission.
-
-## Persistent SFZ worker boundary
-
-The SFZ backend uses a `PersistentSfizzPool` keyed by the resolved SFZ asset and
-render settings. One resident worker owns one process, one Synth, and one loaded
-instrument for its lifetime. An InstrumentKey may own multiple independent
-replicas up to `--sfz-max-replicas`; a cold key must complete one render before
-it may scale out so the pool has a real working-set observation for admission.
-
-Execution concurrency and memory are separate controls. Global `--concurrency`
-limits all in-flight work. SFZ uses that full execution budget by default, while
-its independent auto RAM pool controls resident worker population and idle-LRU
-eviction. Each worker reports current sfizz-managed bytes after LOAD and after
-every RENDER. The pool records observed per-instrument worker peaks and positive
-task growth, uses those observations for later admission, and never kills busy
-workers. The memory budget is therefore a steady-state target rather than a hard
-RSS allocation guarantee.
-
-Every render starts with offline-baseline restore and seed 0. Worker crashes,
-timeouts, protocol errors, or render failures invalidate that resident entry and
-remove partial raw WAV output; there is no silent legacy-renderer fallback.
-
-
-## Observability and console UI (v0.4.2)
-
-The coordinator is the sole owner of user-facing rendering progress. Backend workers
-return values, timings, and captured diagnostics instead of printing directly. This
-keeps concurrent SFZ/GM/FX work from interleaving terminal output and gives batch
-mode one coherent view of the system.
-
-Event vocabulary is intentionally small: `PLAN`, `CACHE`, `RAW`, `FX`, `MIX`,
-`DONE`, `WARN`, and `FAIL`. RAW tasks carry a backend attribute (`sfz` or
-`fluidsynth`) rather than inventing a second task vocabulary. The default TTY color
-semantics are blue RAW/SFZ, cyan FluidSynth, magenta FX, yellow MIX, green
-DONE/cache, yellow warning, red failure, and gray metadata. `--color auto` is the
-default; `always`, `never`, and the `NO_COLOR` environment convention are supported.
-
-Single-song normal mode shows one compact line per completed task plus the final
-output. Batch normal mode suppresses per-stem success spam and emits a periodic
-heartbeat containing completion, active/pending work, cache hits, failures, and
-throughput. `--verbose` enables planning/cache/task details. `--debug` additionally
-shows backend diagnostics captured during successful tasks.
-
-The production backends are quiet by construction:
-
-- persistent sfizz-worker stderr is continuously drained and retained as a bounded diagnostic tail;
-- embedded FluidSynth runs in an isolated GM worker whose native process stderr is
-  captured at the file-descriptor level, including ALSA/JACK/SDL messages emitted by
-  C libraries;
-- `mrp-lv2-chain` and legacy `lv2apply` stdout/stderr are captured by the FX worker;
-- mixer gain details are no longer printed from DSP code.
-
-A task failure still surfaces its real backend error. Successful diagnostics are only
-expanded in debug mode, so hiding headless warnings does not sacrifice failure
-information.
-
-Persistent sinks are optional and independent of console rendering:
+Compatibility aliases remain accepted by the CLI:
 
 ```text
---log-file FILE    append human-readable, ANSI-free displayed events
---json-log FILE    append structured JSONL events (including hidden task events)
---heartbeat SEC    batch dashboard refresh interval (default 5)
+render --jobs          -> --concurrency
+batch  --workers       -> --concurrency
+--*-workers            -> matching --*-concurrency
 ```
 
-The JSONL sink is intended for corpus-scale audit/throughput analysis and is not tied
-to TTY formatting.
+They are aliases only; current documentation and logs use the canonical
+`concurrency` vocabulary.
+
+## 5. Scheduling priority and backpressure
+
+The central dispatch priority is:
+
+```text
+MIX > FX > RAW
+```
+
+The scheduler keeps finishing downstream work ahead of creating more expensive
+intermediate data.
+
+When queued/running FX reaches `--max-fx-backlog`, new RAW dispatch is withheld.
+RAW tasks already in flight are allowed to finish. The automatic backlog
+threshold is:
+
+```text
+max(concurrency * 2, 4)
+```
+
+This is a dispatch throttle, not a separate queue or worker count.
+
+## 6. Bounded song admission
+
+Batch mode never needs to materialize the whole corpus as task objects.
+`--active-songs` limits the number of live song plans. Completing or failing one
+song admits the next input.
+
+Default:
+
+```text
+--active-songs 32
+```
+
+This control is independent of task concurrency. A large active-song window can
+help expose enough instrument diversity and same-instrument pressure to keep
+workers busy, while `--concurrency` remains the execution ceiling.
+
+## 7. Persistent SFZ memory policy
+
+SFZ execution capacity and SFZ resident memory are deliberately separate.
+
+With no explicit `--sfz-memory-budget`, MRP computes:
+
+```text
+by_total     = 70% of physical RAM
+by_available = max(MemAvailable - 1 GiB, 512 MiB)
+budget       = max(512 MiB, min(by_total, by_available))
+```
+
+The budget is a steady-state admission target, not a strict OS RSS cap.
+
+Each worker reports:
+
+- sfizz-managed working-set bytes;
+- resident sample bytes;
+- peak sample bytes;
+- number of fully resident samples;
+- positive working-set growth observed during a task.
+
+Historical observations survive worker eviction. They are used to reserve known
+future growth and to decide whether a warm key can admit another replica.
+
+Eviction unit: **worker replica**, not InstrumentKey.
+
+Eviction rules:
+
+- only idle workers are eligible;
+- eviction is global LRU;
+- busy workers are never killed;
+- worker processes are closed when the coordinator closes;
+- a failed/crashed worker is invalidated rather than silently reused.
+
+## 8. Persistent SFZ worker contract
+
+The production SFZ path is:
+
+```text
+Python coordinator
+  -> mrp-sfizz-worker
+  -> patched libsfizz
+```
+
+Current contract identifiers:
+
+```text
+MRP package version:       0.5.0
+worker protocol:           5
+minimum offline API:       3
+task seed:                 0
+sample-loading policy:     deterministic-lazy
+renderer contract:         mrp-persistent-sfizz-v3
+raw cache schema:          raw-sfz-v3
+```
+
+The pinned fork is based on sfizz 1.2.3.
+
+Each task restores the fork's offline baseline before rendering. The production
+path has no fallback to the old per-stem `sfizz_render` subprocess renderer.
+
+Worker crash, timeout, protocol error, or render failure invalidates that
+resident entry and removes a partial raw output if one was produced.
+
+## 9. FluidSynth raw contract
+
+Current GM raw cache schema:
+
+```text
+raw-gm-v4
+```
+
+The raw identity includes the exact prepared MIDI bytes, SoundFont identity,
+render mode, synth gain, sample rate, one-core policy, and multi-output block
+size where applicable.
+
+## 10. Artifact-addressed raw cache
+
+The prepared MIDI bytes handed to a renderer are the authoritative symbolic
+cache input.
+
+MRP hashes the final prepared MIDI after operations such as:
+
+- track split/filtering;
+- velocity adaptation;
+- controller preservation;
+- timing preservation;
+- drum/kick note filtering;
+- GM program remapping.
+
+Any transformation that changes the renderer input bytes therefore invalidates
+the raw stem without requiring a hand-maintained transform-version bump.
+
+Downstream patch gain, effect parameters, and master settings are excluded from
+the raw sampler fingerprint so those stages can be retuned without forcing
+another sampler pass.
+
+`--rebuild-raw` bypasses matching raw artifacts. In batch mode it does not by
+itself bypass a persisted DONE song; use `--force --rebuild-raw` when both state
+and raw cache must be ignored.
+
+## 11. Batch SQLite resume journal
+
+Batch mode defaults to:
+
+```text
+renders/render-state.sqlite3
+```
+
+SQLite runs in WAL mode. The coordinator is the only writer.
+
+The journal records song state and physical task attempts. Important behavior:
+
+- `DONE` + existing final output -> skipped;
+- interrupted/RUNNING -> re-planned on the next run;
+- `FAILED` -> skipped unless `--retry-failed`;
+- `--force` -> ignore persisted DONE/FAILED state and re-plan.
+
+The song identity contains a SHA-256 of source MIDI contents. Editing a MIDI in
+place therefore cannot accidentally reuse an old DONE row.
+
+The batch rendering-system identity currently uses schema
+`render-system-v2` plus the prepared-MIDI contract `artifact-addressed-v1`. It
+includes patch-config contents, core rendering settings, configured asset
+identities, the native FX helper identity, and the persistent sfizz renderer
+identity.
+
+## 12. Failure semantics
+
+A physical task failure marks its song FAILED and records the error. Other songs
+continue.
+
+Work already in flight for the failed song may return, but no new downstream
+work is scheduled for it. Planning failures are also persisted per song and do
+not abort the rest of corpus admission.
+
+There is no silent renderer substitution after a backend failure.
+
+## 13. Console/logging contract
+
+The coordinator is the sole owner of user-facing rendering progress. Native
+backends return or expose captured diagnostics instead of printing successful
+progress directly into the shared terminal.
+
+Event vocabulary is intentionally small:
+
+```text
+PLAN CACHE RAW FX MIX DONE WARN FAIL
+```
+
+RAW events carry their backend (`sfz` or `fluidsynth`) as metadata.
+
+Normal single-song mode prints compact task completion. Normal batch mode uses a
+low-noise heartbeat rather than one success line per stem.
+
+```text
+--verbose              planning/cache/task details
+--debug                successful backend diagnostics
+--color auto|always|never
+--log-file FILE        human-readable ANSI-free sink
+--json-log FILE        structured JSONL sink
+--heartbeat SECONDS    batch dashboard interval, default 5
+```
+
+`NO_COLOR` is respected when color mode is `auto`.
+
+Backend stderr handling:
+
+- persistent sfizz worker stderr is continuously drained into bounded
+  diagnostics;
+- embedded FluidSynth native stderr is captured inside its process worker,
+  including headless ALSA/JACK/SDL noise;
+- `mrp-lv2-chain` and explicit legacy `lv2apply` output is captured by the FX
+  worker;
+- backend failures still surface their diagnostic error text.
+
+## 14. Throughput metrics
+
+Batch summaries expose three end-to-end measures:
+
+- `songs/min` — completed songs per wall-clock minute;
+- `track× realtime` — source music seconds times rendered logical source-track
+  count divided by wall time;
+- `ms / track-bar` — wall-clock milliseconds per rendered source track-bar.
+
+Track-bar accounting follows the MIDI time-signature timeline. Derived stems
+sharing the same source track index are counted once for structural metrics.
+
+## 15. Reference commands
+
+Single song:
+
+```bash
+midi-render render song.mid --concurrency 5
+```
+
+Dataset:
+
+```bash
+midi-render batch /data/midi \
+  --output-dir /data/rendered \
+  --work-root /scratch/mrp \
+  --state-db /scratch/mrp-state.sqlite3 \
+  --active-songs 24 \
+  --concurrency 24 \
+  --include-melody \
+  --sfz-max-replicas 2
+```
+
+For most runs, tune only `--concurrency`, `--active-songs`, and optionally
+`--sfz-max-replicas`; leave backend caps, FX backlog, and SFZ RAM admission on
+AUTO unless profiling gives a concrete reason to override them.
