@@ -378,3 +378,19 @@ Raw SFZ cache identity remains content-addressed and includes the persistent
 renderer contract, deterministic task seed, worker protocol/API version, sample
 loading policy, and binary identities of the worker and libsfizz when available.
 Old renderer contracts are therefore not reused accidentally.
+
+
+## Concurrency vocabulary and AUTO backend policy
+
+The global execution budget is now named `--concurrency`. Batch `--workers` and
+single-file `--jobs` remain compatibility aliases. Backend `--*-workers` flags
+likewise remain aliases for the corresponding advanced `--*-concurrency`
+overrides.
+
+Normal batch use only needs `--concurrency`, `--active-songs`, and optionally
+`--sfz-max-replicas`. SFZ, FX, and MIX resolve to the global concurrency budget
+when no backend override is supplied. GM/FluidSynth resolves conservatively from
+the global budget and currently scales from one process on small runs to at most
+four. The SFZ memory budget and FX backlog threshold remain automatic unless
+explicitly overridden. This changes resource-policy defaults, not the task DAG or
+central dispatch priority.

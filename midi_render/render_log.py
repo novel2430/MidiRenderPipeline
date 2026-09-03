@@ -170,40 +170,40 @@ class RenderLogger:
         *,
         total: int,
         active_songs: int,
-        workers: int,
-        sfz_workers: int,
+        concurrency: int,
+        backend_concurrency: dict[str, int],
+        backend_auto: dict[str, bool],
         sfz_max_replicas: int,
-        gm_workers: int,
-        fx_workers: int,
-        mix_workers: int,
         sfz_memory_budget: str,
         state_db: Path,
         run_identity: str,
     ) -> None:
         self._line(f"{self._style('◆ MRP Batch', 'raw', bold=True)}")
-        self._line(f"  {total:,} MIDI · workers {workers} · active {active_songs}")
+        self._line(
+            f"  {total:,} MIDI · concurrency {concurrency} · active songs {active_songs}"
+        )
         if self.verbose:
+            parts = []
+            for key, label in (("sfz", "SFZ"), ("gm", "GM"), ("fx", "FX"), ("mix", "MIX")):
+                value = backend_concurrency[key]
+                prefix = "auto→" if backend_auto.get(key, False) else ""
+                parts.append(f"{label} {prefix}{value}")
+            self._line(self._style(f"  resources: {' · '.join(parts)}", "muted"))
             self._line(
                 self._style(
-                    f"  caps: SFZ {sfz_workers} · GM {gm_workers} · FX {fx_workers} · MIX {mix_workers}",
+                    f"  SFZ replicas/key: {sfz_max_replicas} · RAM {sfz_memory_budget}",
                     "muted",
                 )
             )
-            self._line(
-                self._style(
-                    f"  SFZ replicas/key: {sfz_max_replicas}",
-                    "muted",
-                )
-            )
-            self._line(self._style(f"  SFZ memory budget: {sfz_memory_budget}", "muted"))
             self._line(self._style(f"  state: {state_db}", "muted"))
             self._line(self._style(f"  run:   {run_identity}", "muted"))
         self._event(
             "batch_start",
             total=total,
             active_songs=active_songs,
-            workers=workers,
-            backend_caps={"sfz": sfz_workers, "gm": gm_workers, "fx": fx_workers, "mix": mix_workers},
+            concurrency=concurrency,
+            backend_concurrency=backend_concurrency,
+            backend_auto=backend_auto,
             sfz_max_replicas=sfz_max_replicas,
             sfz_memory_budget=sfz_memory_budget,
             state_db=str(state_db),
@@ -455,19 +455,22 @@ class RenderLogger:
                 self._line(f"    ms / track-bar     {ms_per_track_bar:.1f} ms")
         if sfz_stats is not None and sfz_stats.tasks:
             reuse_rate = 100.0 * sfz_stats.worker_reuses / sfz_stats.tasks
-            self._line("  SFZ workers")
+            self._line("  SFZ pool")
             self._line(f"    tasks             {sfz_stats.tasks:,}")
             self._line(f"    starts            {sfz_stats.worker_starts:,}")
             self._line(f"    reuses            {sfz_stats.worker_reuses:,}")
             self._line(f"    reuse rate        {reuse_rate:.1f}%")
             self._line(f"    scale-outs        {sfz_stats.worker_scale_outs:,}")
-            self._line(f"    peak residents    {sfz_stats.peak_resident_workers:,}")
-            self._line(f"    peak active       {sfz_stats.peak_active_workers:,}")
+            self._line("    Concurrency")
+            self._line(f"      peak active     {sfz_stats.peak_active_workers:,}")
+            self._line("    Residency")
+            self._line(f"      peak workers    {sfz_stats.peak_resident_workers:,}")
             self._line(
-                f"    peak replicas/key {sfz_stats.peak_replicas_per_key:,} / {sfz_stats.replica_limit:,}"
+                f"      peak replicas/key {sfz_stats.peak_replicas_per_key:,} / {sfz_stats.replica_limit:,}"
             )
-            self._line(f"    worker evictions  {sfz_stats.worker_evictions:,}")
-            self._line(f"    worker failures   {sfz_stats.worker_failures:,}")
+            self._line("    Lifecycle")
+            self._line(f"      evictions       {sfz_stats.worker_evictions:,}")
+            self._line(f"      failures        {sfz_stats.worker_failures:,}")
             self._line("  SFZ memory")
             self._line(f"    peak working set    {sfz_stats.peak_working_set_bytes / (1024 ** 3):.2f} GiB")
             self._line(f"    peak sample payload {sfz_stats.peak_sample_resident_bytes / (1024 ** 3):.2f} GiB")

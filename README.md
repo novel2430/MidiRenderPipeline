@@ -49,9 +49,9 @@ GM stems are present, they are grouped into batches of up to 16: each stem is
 remapped to its own MIDI channel, audio group, and effects group, so one loaded
 SoundFont can render the batch while default FluidSynth reverb/chorus remain
 isolated per stem. The batch loop uses 1024-frame blocks. FluidSynth currently
-uses one internal synthesis core. In v0.4, `--jobs` is the single-file alias for
-the coordinator's **global task budget** and is intentionally not reused as
-`synth.cpu-cores`. A rare pipeline track that
+uses one internal synthesis core. `--concurrency` is the coordinator's global
+task budget (`--jobs` remains a single-file compatibility alias) and is
+intentionally not reused as `synth.cpu-cores`. A rare pipeline track that
 itself uses multiple MIDI channels takes the same native single-stem file-renderer
 path rather than collapsing its MIDI channel state.
 
@@ -206,7 +206,7 @@ midi-render batch /path/to/midi-set \
   --work-root renders/work-batch \
   --state-db renders/render-state.sqlite3 \
   --active-songs 32 \
-  --workers 5
+  --concurrency 5
 ```
 
 Completed outputs are skipped on restart. The resumable song identity includes the
@@ -217,19 +217,21 @@ DONE/FAILED state. Batch outputs preserve the input directory tree below
 
 ### Persistent SFZ working set
 
-SFZ tasks use one persistent process/Synth per instrument identity. The patched
-sfizz backend keeps normal sample preloads, then synchronously promotes a sample
-to full residency on first touch. This preserves deterministic offline output
-without decoding the whole instrument up front. Matching RenderTasks reuse the
-same worker serially; different instrument workers may run concurrently.
+SFZ tasks use persistent process/Synth workers keyed by instrument identity. The
+patched sfizz backend keeps normal sample preloads, then synchronously promotes a
+sample to full residency on first touch. This preserves deterministic offline
+output without decoding the whole instrument up front. By default an instrument
+has one resident worker; `--sfz-max-replicas N` allows warmed instruments to
+scale out to multiple independent resident workers when queue pressure and the
+RAM pool permit it.
 
-`--sfz-workers` limits simultaneously executing SFZ tasks. `--sfz-memory-budget SIZE` controls the aggregate observed working-set target for persistent sfizz
-workers (for example `8GiB`). The budget is not a claim that an unseen task can be
-known exactly before it runs: MRP learns observed sfizz-managed high-water marks and task
-growth from completed renders, uses those observations for later admission, and
-trims idle least-recently-used workers when the observed working set exceeds the
-target. Busy workers are never killed. Worker processes live only for the current
-MRP run.
+`--concurrency N` is the global simultaneous-task budget for the whole rendering
+coordinator. SFZ, FX, and MIX have no smaller backend cap by default; FluidSynth
+uses a conservative automatic process fan-out. Backend-specific concurrency
+flags remain available as advanced overrides. `--sfz-memory-budget SIZE` is also
+an advanced override: by default MRP derives the persistent sfizz working-set
+target from host memory, learns observed high-water marks and task growth, and
+trims idle least-recently-used workers when needed. Busy workers are never killed.
 
 ### Rendering logs
 

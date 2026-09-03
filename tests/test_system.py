@@ -33,7 +33,7 @@ def _cached_plan(tmp_path: Path, name: str, value: float = 0.1) -> SongPlan:
     patch = Patch("piano", "test", tmp_path / "unused.sfz", gain_db=0.0, effects=())
     rendered = RenderedStem(track, "piano", patch, raw, 0.0)
     stem_id = make_stem_id(1, "piano")
-    settings = RenderSettings(workers=2, active_songs=1, keep_work=True).normalized()
+    settings = RenderSettings(concurrency=2, active_songs=1, keep_work=True).normalized()
     return SongPlan(
         song_id=make_song_id(midi, output),
         midi_path=midi,
@@ -67,7 +67,7 @@ def test_coordinator_uses_cached_raw_and_persists_done_state(tmp_path: Path):
 def test_active_window_admits_next_song_after_completion(tmp_path: Path):
     first = _cached_plan(tmp_path, "first", 0.1)
     second = _cached_plan(tmp_path, "second", 0.2)
-    settings = RenderSettings(workers=2, active_songs=1, keep_work=True).normalized()
+    settings = RenderSettings(concurrency=2, active_songs=1, keep_work=True).normalized()
     first.settings = settings
     second.settings = settings
     with RenderingCoordinator(settings) as coordinator:
@@ -91,11 +91,11 @@ def test_task_model_allows_one_physical_task_to_cover_multiple_stems():
 
 def test_fx_backpressure_blocks_new_raw_dispatch_when_fx_pool_is_saturated(tmp_path: Path):
     settings = RenderSettings(
-        workers=2,
-        sfz_workers=2,
-        gm_workers=1,
-        fx_workers=1,
-        mix_workers=1,
+        concurrency=2,
+        sfz_concurrency=2,
+        gm_concurrency=1,
+        fx_concurrency=1,
+        mix_concurrency=1,
         active_songs=1,
         max_fx_backlog=1,
     ).normalized()
@@ -133,3 +133,42 @@ def test_gm_worker_captures_native_stderr(monkeypatch):
     result = system._execute_gm(system._GMPayload((), 48_000))
     assert result.value == []
     assert "ALSA/JACK warning" in result.diagnostics
+
+
+def test_resource_policy_auto_uses_global_concurrency_for_general_backends():
+    from midi_render.system import resolve_resource_policy
+
+    policy = resolve_resource_policy(RenderSettings(concurrency=24))
+    assert policy.concurrency == 24
+    assert policy.sfz_concurrency == 24
+    assert policy.fx_concurrency == 24
+    assert policy.mix_concurrency == 24
+    assert policy.gm_concurrency == 4
+    assert policy.max_fx_backlog == 48
+
+
+def test_resource_policy_keeps_small_hosts_conservative_for_gm():
+    from midi_render.system import resolve_resource_policy
+
+    assert resolve_resource_policy(RenderSettings(concurrency=4)).gm_concurrency == 1
+    assert resolve_resource_policy(RenderSettings(concurrency=8)).gm_concurrency == 2
+    assert resolve_resource_policy(RenderSettings(concurrency=16)).gm_concurrency == 4
+
+
+def test_resource_policy_advanced_overrides_are_clamped_to_global_budget():
+    from midi_render.system import resolve_resource_policy
+
+    settings = RenderSettings(
+        concurrency=6,
+        sfz_concurrency=99,
+        gm_concurrency=3,
+        fx_concurrency=2,
+        mix_concurrency=99,
+        max_fx_backlog=7,
+    )
+    policy = resolve_resource_policy(settings)
+    assert policy.sfz_concurrency == 6
+    assert policy.gm_concurrency == 3
+    assert policy.fx_concurrency == 2
+    assert policy.mix_concurrency == 6
+    assert policy.max_fx_backlog == 7

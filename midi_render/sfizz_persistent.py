@@ -657,7 +657,7 @@ class PersistentSfizzPool:
     def __init__(
         self,
         *,
-        max_workers: int,
+        max_concurrency: int,
         blocksize: int,
         samplerate: int,
         quality: int,
@@ -668,11 +668,11 @@ class PersistentSfizzPool:
         library_path: Path | None = None,
         worker_factory: Callable[..., ResidentSfizzWorker] = ResidentSfizzWorker,
     ):
-        if max_workers < 1:
-            raise ValueError("SFZ max workers must be >= 1")
+        if max_concurrency < 1:
+            raise ValueError("SFZ max concurrency must be >= 1")
         if max_replicas_per_key < 1:
             raise ValueError("SFZ max replicas per key must be >= 1")
-        self.max_workers = max_workers
+        self.max_concurrency = max_concurrency
         self.max_replicas_per_key = max_replicas_per_key
         self.blocksize = blocksize
         self.samplerate = samplerate
@@ -688,7 +688,7 @@ class PersistentSfizzPool:
             raise ValueError("SFZ memory budget must be > 0")
 
         self._executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="mrp-sfizz"
+            max_workers=max_concurrency, thread_name_prefix="mrp-sfizz"
         )
         self._lock = threading.Lock()
         # Worker instances, not InstrumentKeys, are the eviction/lifecycle unit.

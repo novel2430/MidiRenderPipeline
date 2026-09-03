@@ -47,6 +47,7 @@ from .system import (
     Backend,
     RenderSettings,
     RenderingCoordinator,
+    resolve_resource_policy,
     SongPlan,
     Stage,
     StateStore,
@@ -439,16 +440,19 @@ def _render_policy(track, resolution, registry: PatchRegistry) -> tuple[str, boo
 def _render_settings_from_args(
     args: argparse.Namespace, *, active_songs: int = 1, registry: PatchRegistry | None = None
 ) -> RenderSettings:
-    workers = int(getattr(args, "workers", getattr(args, "jobs", 5)))
+    concurrency_value = getattr(args, "concurrency", None)
+    if concurrency_value is None:
+        concurrency_value = getattr(args, "workers", getattr(args, "jobs", 5))
+    concurrency = int(concurrency_value)
     sfizz_worker = None if registry is None else registry.tools_root / "mrp-sfizz-worker"
     sfizz_library = None if registry is None else registry.sfizz_library
     return RenderSettings(
-        workers=workers,
-        sfz_workers=getattr(args, "sfz_workers", None),
+        concurrency=concurrency,
+        sfz_concurrency=getattr(args, "sfz_concurrency", getattr(args, "sfz_workers", None)),
         sfz_max_replicas=int(getattr(args, "sfz_max_replicas", 1)),
-        gm_workers=int(getattr(args, "gm_workers", 1)),
-        fx_workers=getattr(args, "fx_workers", None),
-        mix_workers=int(getattr(args, "mix_workers", 1)),
+        gm_concurrency=getattr(args, "gm_concurrency", getattr(args, "gm_workers", None)),
+        fx_concurrency=getattr(args, "fx_concurrency", getattr(args, "fx_workers", None)),
+        mix_concurrency=getattr(args, "mix_concurrency", getattr(args, "mix_workers", None)),
         blocksize=int(args.blocksize),
         samplerate=int(args.samplerate),
         quality=int(args.quality),
@@ -881,15 +885,24 @@ def cmd_batch(args: argparse.Namespace) -> int:
     skipped_failed = 0
 
     with _render_logger(args, mode="batch") as logger:
+        resources = resolve_resource_policy(settings)
         logger.batch_header(
             total=len(files),
             active_songs=settings.active_songs,
-            workers=settings.workers,
-            sfz_workers=int(settings.sfz_workers or 1),
+            concurrency=resources.concurrency,
+            backend_concurrency={
+                "sfz": resources.sfz_concurrency,
+                "gm": resources.gm_concurrency,
+                "fx": resources.fx_concurrency,
+                "mix": resources.mix_concurrency,
+            },
+            backend_auto={
+                "sfz": settings.sfz_concurrency is None,
+                "gm": settings.gm_concurrency is None,
+                "fx": settings.fx_concurrency is None,
+                "mix": settings.mix_concurrency is None,
+            },
             sfz_max_replicas=settings.sfz_max_replicas,
-            gm_workers=settings.gm_workers,
-            fx_workers=int(settings.fx_workers or 1),
-            mix_workers=settings.mix_workers,
             sfz_memory_budget=(
                 "auto" if settings.sfz_memory_budget is None
                 else format_bytes(settings.sfz_memory_budget)
@@ -983,13 +996,22 @@ def cmd_batch(args: argparse.Namespace) -> int:
         return 1 if failed or planning_failures else 0
 
 def _add_render_engine_args(p: argparse.ArgumentParser, *, batch: bool = False) -> None:
-    # --jobs remains a compatibility alias for the global worker budget on the
-    # single-file command. Batch uses the clearer --workers spelling.
-    if batch:
-        p.add_argument("--workers", type=int, default=5, help="global concurrent task budget")
-    else:
-        p.add_argument("--jobs", type=int, default=5, help="global concurrent task budget")
-    p.add_argument("--sfz-workers", type=int, help="maximum simultaneous SFZ tasks")
+    # One public execution budget. --workers (batch) and --jobs (single-file)
+    # remain compatibility aliases so existing scripts keep working.
+    aliases = ("--concurrency", "--workers") if batch else ("--concurrency", "--jobs")
+    p.add_argument(
+        *aliases,
+        dest="concurrency",
+        type=int,
+        default=5,
+        help="global simultaneous task budget",
+    )
+    p.add_argument(
+        "--sfz-concurrency", "--sfz-workers",
+        dest="sfz_concurrency",
+        type=int,
+        help="advanced override for simultaneous SFZ tasks (default: auto)",
+    )
     p.add_argument(
         "--sfz-max-replicas",
         type=int,
@@ -1001,12 +1023,31 @@ def _add_render_engine_args(p: argparse.ArgumentParser, *, batch: bool = False) 
         type=_parse_byte_size,
         default=None,
         metavar="SIZE",
-        help="persistent SFZ worker working-set budget (e.g. 8GiB; default: auto)",
+        help="advanced SFZ working-set budget override (e.g. 8GiB; default: auto)",
     )
-    p.add_argument("--gm-workers", type=int, default=1, help="persistent FluidSynth worker processes")
-    p.add_argument("--fx-workers", type=int, help="maximum simultaneous FX-chain tasks")
-    p.add_argument("--mix-workers", type=int, default=1, help="maximum simultaneous mix/export tasks")
-    p.add_argument("--max-fx-backlog", type=int, help="pause new raw work when queued/running FX reaches this count")
+    p.add_argument(
+        "--gm-concurrency", "--gm-workers",
+        dest="gm_concurrency",
+        type=int,
+        help="advanced override for simultaneous FluidSynth tasks (default: auto)",
+    )
+    p.add_argument(
+        "--fx-concurrency", "--fx-workers",
+        dest="fx_concurrency",
+        type=int,
+        help="advanced override for simultaneous FX-chain tasks (default: auto)",
+    )
+    p.add_argument(
+        "--mix-concurrency", "--mix-workers",
+        dest="mix_concurrency",
+        type=int,
+        help="advanced override for simultaneous mix/export tasks (default: auto)",
+    )
+    p.add_argument(
+        "--max-fx-backlog",
+        type=int,
+        help="advanced override for RAW backpressure threshold (default: auto)",
+    )
     p.add_argument("--blocksize", type=int, default=1024)
     p.add_argument("--samplerate", type=int, default=48_000)
     p.add_argument("--quality", type=int, default=2)
@@ -1075,13 +1116,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     for attr, option in (
-        ("jobs", "--jobs"),
-        ("workers", "--workers"),
-        ("sfz_workers", "--sfz-workers"),
+        ("concurrency", "--concurrency"),
+        ("sfz_concurrency", "--sfz-concurrency"),
         ("sfz_max_replicas", "--sfz-max-replicas"),
-        ("gm_workers", "--gm-workers"),
-        ("fx_workers", "--fx-workers"),
-        ("mix_workers", "--mix-workers"),
+        ("gm_concurrency", "--gm-concurrency"),
+        ("fx_concurrency", "--fx-concurrency"),
+        ("mix_concurrency", "--mix-concurrency"),
         ("active_songs", "--active-songs"),
         ("max_fx_backlog", "--max-fx-backlog"),
     ):

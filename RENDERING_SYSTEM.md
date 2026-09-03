@@ -66,18 +66,18 @@ them.
 Why the pools differ:
 
 - SFZ work uses instrument-affine resident worker processes. Each process owns
-  one Synth/SFZ, loads samples into RAM once, and executes matching tasks
-  serially. Different resident processes may render concurrently.
+  one Synth/SFZ and executes one task at a time. A warmed InstrumentKey may own
+  multiple independent replicas, so same-instrument tasks can run concurrently.
 - FluidSynth is embedded in Python, so GM work gets persistent process isolation.
   The worker processes are long-lived; each physical GM task still creates the
   synth/session required by the v0.3.14 native-file or multi-output fast path.
 - FX work is already isolated in `mrp-lv2-chain`, so threads supervise one native
   process per effected stem.
-- Mix/export runs in a small thread pool and is normally low-cost relative to
-  synthesis/DSP.
+- Mix/export runs in a thread pool sized to the resolved resource policy.
 
-The global `--workers` / single-file `--jobs` budget prevents the independent
-backend caps from multiplying into accidental CPU oversubscription.
+The global `--concurrency` budget is the coordinator's hard in-flight ceiling.
+Backend-specific capacities are AUTO by default and cannot multiply past that
+global budget; legacy `--workers` / `--jobs` spellings remain aliases.
 
 ## Backpressure
 
@@ -135,7 +135,7 @@ Single-file rendering uses exactly the same coordinator with an active window
 of one:
 
 ```bash
-midi-render render song.mid --jobs 5
+midi-render render song.mid --concurrency 5
 ```
 
 Long-running dataset rendering:
@@ -146,30 +146,36 @@ midi-render batch /data/midi \
   --work-root /scratch/mrp \
   --state-db /scratch/mrp-state.sqlite3 \
   --active-songs 64 \
-  --workers 32 \
-  --gm-workers 4
+  --concurrency 32 \
+  --sfz-max-replicas 2
 ```
 
-Useful controls:
+Primary resource controls:
 
 ```text
---workers N          global simultaneous task budget (batch)
---jobs N             same global budget for single-file render compatibility
---sfz-workers N      cap simultaneous SFZ tasks
---sfz-memory-budget SIZE  persistent SFZ worker working-set target (default auto)
---gm-workers N       cap FluidSynth worker processes
---fx-workers N       cap native LV2-chain tasks
---mix-workers N      cap mix/export tasks
---active-songs N     bounded planning/admission window
---max-fx-backlog N   raw-stage backpressure threshold
---retry-failed       retry DB entries previously marked FAILED
---force              ignore persisted DONE/FAILED state
---rebuild-raw        ignore matching raw-stem cache files
---verbose            print per-track planning during batch mode
+--concurrency N       global simultaneous task budget
+--active-songs N      bounded song planning/admission window
+--sfz-max-replicas N  maximum resident replicas for one SFZ InstrumentKey
 ```
 
-Backend caps may be larger than the global budget; the coordinator still never
-runs more physical tasks than the global budget at once.
+Normally those are the only concurrency knobs a user needs. The coordinator
+resolves backend capacity automatically: SFZ, FX, and MIX may use the full global
+budget, while GM/FluidSynth uses a conservative process fan-out that grows with
+`--concurrency` and currently tops out at four. The following remain advanced
+overrides and are not required for normal use:
+
+```text
+--sfz-concurrency N
+--gm-concurrency N
+--fx-concurrency N
+--mix-concurrency N
+--sfz-memory-budget SIZE
+--max-fx-backlog N
+```
+
+Legacy `--workers`, `--jobs`, and `--*-workers` spellings remain accepted as CLI
+aliases. Backend overrides are effective caps inside the global budget; specifying
+a value larger than `--concurrency` does not create additional execution slots.
 
 Batch performance is reported in three complementary units:
 
@@ -197,21 +203,19 @@ admission.
 ## Persistent SFZ worker boundary
 
 The SFZ backend uses a `PersistentSfizzPool` keyed by the resolved SFZ asset and
-render settings. One resident entry owns one process, one Synth, and one loaded
-instrument for its lifetime. There is at most one worker per key, so a second task
-for a busy instrument stays pending while unrelated resident instruments may still run.
+render settings. One resident worker owns one process, one Synth, and one loaded
+instrument for its lifetime. An InstrumentKey may own multiple independent
+replicas up to `--sfz-max-replicas`; a cold key must complete one render before
+it may scale out so the pool has a real working-set observation for admission.
 
-Execution concurrency and memory are separate controls. `--sfz-workers` limits
-running SFZ tasks; `--sfz-memory-budget` is the aggregate working-set target for
-persistent sfizz workers. MRP does not reserve a theoretical whole-instrument
-size. Instead, each worker reports its current sfizz-managed bytes after LOAD and
-after every RENDER. The pool records observed per-instrument worker peaks and
-positive task growth, uses those observations for later admission, and evicts only
-idle LRU workers when needed. A never-before-seen workload is admitted once so its
-real footprint can be learned; therefore the budget is intentionally a
-steady-state target rather than a hard allocation guarantee. The coordinator does
-not move a task into `inflight` until the pool can admit it from the observations
-available at dispatch time.
+Execution concurrency and memory are separate controls. Global `--concurrency`
+limits all in-flight work. SFZ uses that full execution budget by default, while
+its independent auto RAM pool controls resident worker population and idle-LRU
+eviction. Each worker reports current sfizz-managed bytes after LOAD and after
+every RENDER. The pool records observed per-instrument worker peaks and positive
+task growth, uses those observations for later admission, and never kills busy
+workers. The memory budget is therefore a steady-state target rather than a hard
+RSS allocation guarantee.
 
 Every render starts with offline-baseline restore and seed 0. Worker crashes,
 timeouts, protocol errors, or render failures invalidate that resident entry and

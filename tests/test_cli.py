@@ -675,3 +675,30 @@ def test_rebuild_raw_parser_flag_is_available_for_render_and_batch():
     batch = parser.parse_args(["batch", "dataset", "--rebuild-raw"])
     assert render.rebuild_raw is True
     assert batch.rebuild_raw is True
+
+
+def test_batch_cli_uses_concurrency_as_canonical_global_budget():
+    parser = cli.build_parser()
+    args = parser.parse_args(["batch", "input", "--concurrency", "12"])
+    assert args.concurrency == 12
+    assert args.sfz_concurrency is None
+    assert args.gm_concurrency is None
+    assert args.fx_concurrency is None
+    assert args.mix_concurrency is None
+
+
+def test_legacy_worker_cli_aliases_map_to_concurrency_fields():
+    parser = cli.build_parser()
+    args = parser.parse_args([
+        "batch", "input",
+        "--workers", "10",
+        "--sfz-workers", "7",
+        "--gm-workers", "2",
+        "--fx-workers", "5",
+        "--mix-workers", "3",
+    ])
+    assert args.concurrency == 10
+    assert args.sfz_concurrency == 7
+    assert args.gm_concurrency == 2
+    assert args.fx_concurrency == 5
+    assert args.mix_concurrency == 3

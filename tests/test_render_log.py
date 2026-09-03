@@ -137,3 +137,26 @@ def test_batch_summary_reports_normalized_performance_and_peak_memory_only():
     assert "peak replicas/key 2 / 2" in text
     assert "current working set" not in text
     assert "full samples" not in text
+
+
+def test_batch_header_uses_concurrency_and_marks_auto_backend_policy(tmp_path: Path):
+    stream = _Pipe()
+    logger = RenderLogger(LogOptions(mode="batch", verbosity="verbose", color="never"), stream=stream)
+    logger.batch_header(
+        total=59,
+        active_songs=24,
+        concurrency=24,
+        backend_concurrency={"sfz": 24, "gm": 4, "fx": 24, "mix": 24},
+        backend_auto={"sfz": True, "gm": True, "fx": True, "mix": True},
+        sfz_max_replicas=2,
+        sfz_memory_budget="auto",
+        state_db=tmp_path / "state.sqlite3",
+        run_identity="deadbeef",
+    )
+    logger.close()
+    text = stream.getvalue()
+    assert "59 MIDI · concurrency 24 · active songs 24" in text
+    assert "SFZ auto→24" in text
+    assert "GM auto→4" in text
+    assert "MIX auto→24" in text
+    assert "workers 24" not in text

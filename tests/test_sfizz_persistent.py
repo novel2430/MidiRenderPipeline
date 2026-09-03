@@ -119,7 +119,7 @@ def test_pool_reuses_one_worker_and_reports_new_reuse_semantics(monkeypatch, tmp
     _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -175,7 +175,7 @@ def test_unseen_worker_is_learned_then_idle_lru_is_trimmed(monkeypatch, tmp_path
     piano = _job(tmp_path, "piano", "piano.sfz")
     bass = _job(tmp_path, "bass", "bass.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -219,7 +219,7 @@ def test_explicit_budget_is_a_working_set_target_not_a_hard_unknown_load_limit(m
     _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=1,
+        max_concurrency=1,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -263,7 +263,7 @@ def test_observed_worker_peak_guides_recreated_worker_admission(monkeypatch, tmp
     piano = _job(tmp_path, "piano", "piano.sfz")
     bass = _job(tmp_path, "bass", "bass.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -318,7 +318,7 @@ def test_observed_task_growth_can_throttle_while_another_worker_is_busy(monkeypa
     piano = _job(tmp_path, "piano", "piano.sfz")
     bass = _job(tmp_path, "bass", "bass.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -367,7 +367,7 @@ def test_busy_instrument_has_no_replica(monkeypatch, tmp_path: Path):
     _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -409,7 +409,7 @@ def test_worker_failure_invalidates_entry_and_removes_partial_output(monkeypatch
     _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=1,
+        max_concurrency=1,
         blocksize=1024,
         samplerate=48_000,
         quality=2,
@@ -500,7 +500,7 @@ def test_warm_busy_instrument_scales_out_to_second_replica(monkeypatch, tmp_path
     first = _job(tmp_path, "first", "piano.sfz")
     second = _job(tmp_path, "second", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         max_replicas_per_key=2,
         blocksize=1024,
         samplerate=48_000,
@@ -554,7 +554,7 @@ def test_cold_instrument_does_not_scale_out_before_first_completed_render(monkey
     first = _job(tmp_path, "first", "piano.sfz")
     second = _job(tmp_path, "second", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         max_replicas_per_key=2,
         blocksize=1024,
         samplerate=48_000,
@@ -605,7 +605,7 @@ def test_memory_budget_can_block_warm_scale_out(monkeypatch, tmp_path: Path):
     first = _job(tmp_path, "first", "piano.sfz")
     second = _job(tmp_path, "second", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         max_replicas_per_key=2,
         blocksize=1024,
         samplerate=48_000,
@@ -654,7 +654,7 @@ def test_active_output_path_cannot_be_rendered_by_two_replicas(monkeypatch, tmp_
     _runtime(monkeypatch, tmp_path)
     job = _job(tmp_path, "piano", "piano.sfz")
     pool = persistent.PersistentSfizzPool(
-        max_workers=2,
+        max_concurrency=2,
         max_replicas_per_key=2,
         blocksize=1024,
         samplerate=48_000,

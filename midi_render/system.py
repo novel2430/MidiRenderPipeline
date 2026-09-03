@@ -48,12 +48,19 @@ class Backend(str, Enum):
 
 @dataclass(frozen=True)
 class RenderSettings:
-    workers: int = 5
-    sfz_workers: int | None = None
+    """User-facing render policy.
+
+    ``concurrency`` is the only global execution budget. Backend concurrency
+    values are optional advanced overrides; ``None`` means AUTO. The resolved
+    backend capacities are derived once by :func:`resolve_resource_policy`.
+    """
+
+    concurrency: int = 5
+    sfz_concurrency: int | None = None
     sfz_max_replicas: int = 1
-    gm_workers: int = 1
-    fx_workers: int | None = None
-    mix_workers: int = 1
+    gm_concurrency: int | None = None
+    fx_concurrency: int | None = None
+    mix_concurrency: int | None = None
     blocksize: int = 1024
     samplerate: int = 48_000
     quality: int = 2
@@ -68,46 +75,73 @@ class RenderSettings:
     sfizz_library: Path | None = None
 
     def normalized(self) -> "RenderSettings":
-        if self.workers < 1:
-            raise ValueError("workers must be >= 1")
+        if self.concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
         if self.active_songs < 1:
             raise ValueError("active_songs must be >= 1")
-        sfz = self.workers if self.sfz_workers is None else self.sfz_workers
-        fx = self.workers if self.fx_workers is None else self.fx_workers
-        gm = self.gm_workers
-        mix = self.mix_workers
-        for name, value in (("sfz_workers", sfz), ("gm_workers", gm), ("fx_workers", fx), ("mix_workers", mix)):
-            if value < 1:
+        for name, value in (
+            ("sfz_concurrency", self.sfz_concurrency),
+            ("gm_concurrency", self.gm_concurrency),
+            ("fx_concurrency", self.fx_concurrency),
+            ("mix_concurrency", self.mix_concurrency),
+        ):
+            if value is not None and value < 1:
                 raise ValueError(f"{name} must be >= 1")
         if self.sfz_max_replicas < 1:
             raise ValueError("sfz_max_replicas must be >= 1")
-        backlog = self.max_fx_backlog
-        if backlog is None:
-            backlog = max(self.workers * 2, 4)
-        if backlog < 1:
+        if self.max_fx_backlog is not None and self.max_fx_backlog < 1:
             raise ValueError("max_fx_backlog must be >= 1")
         if self.sfz_memory_budget is not None and self.sfz_memory_budget < 1:
             raise ValueError("sfz_memory_budget must be >= 1")
-        return RenderSettings(
-            workers=self.workers,
-            sfz_workers=sfz,
-            sfz_max_replicas=self.sfz_max_replicas,
-            gm_workers=gm,
-            fx_workers=fx,
-            mix_workers=mix,
-            blocksize=self.blocksize,
-            samplerate=self.samplerate,
-            quality=self.quality,
-            polyphony=self.polyphony,
-            include_melody=self.include_melody,
-            skip_unconfigured=self.skip_unconfigured,
-            keep_work=self.keep_work,
-            active_songs=self.active_songs,
-            max_fx_backlog=backlog,
-            sfz_memory_budget=self.sfz_memory_budget,
-            sfizz_worker=self.sfizz_worker,
-            sfizz_library=self.sfizz_library,
-        )
+        return self
+
+
+@dataclass(frozen=True)
+class ResourcePolicy:
+    """Concrete capacities used by the coordinator after AUTO resolution."""
+
+    concurrency: int
+    sfz_concurrency: int
+    gm_concurrency: int
+    fx_concurrency: int
+    mix_concurrency: int
+    max_fx_backlog: int
+
+
+def _auto_gm_concurrency(concurrency: int) -> int:
+    """Conservative GM process fan-out until FluidSynth has RAM admission.
+
+    A GM physical task owns a process-local FluidSynth session and SoundFont.
+    Scale slowly on small hosts and stop at four processes; advanced users can
+    override this explicitly.
+    """
+
+    return min(concurrency, min(4, max(1, concurrency // 4)))
+
+
+def resolve_resource_policy(settings: RenderSettings) -> ResourcePolicy:
+    settings = settings.normalized()
+    concurrency = settings.concurrency
+
+    def resolved(value: int | None) -> int:
+        return concurrency if value is None else min(value, concurrency)
+
+    return ResourcePolicy(
+        concurrency=concurrency,
+        sfz_concurrency=resolved(settings.sfz_concurrency),
+        gm_concurrency=(
+            _auto_gm_concurrency(concurrency)
+            if settings.gm_concurrency is None
+            else min(settings.gm_concurrency, concurrency)
+        ),
+        fx_concurrency=resolved(settings.fx_concurrency),
+        mix_concurrency=resolved(settings.mix_concurrency),
+        max_fx_backlog=(
+            max(concurrency * 2, 4)
+            if settings.max_fx_backlog is None
+            else settings.max_fx_backlog
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -458,12 +492,13 @@ class RenderingCoordinator:
         total_songs: int | None = None,
     ):
         self.settings = settings.normalized()
+        self.resources = resolve_resource_policy(self.settings)
         self.state = state
         self.logger = logger
         self.total_songs = total_songs
 
         self.sfz_pool = PersistentSfizzPool(
-            max_workers=int(self.settings.sfz_workers or 1),
+            max_concurrency=self.resources.sfz_concurrency,
             max_replicas_per_key=self.settings.sfz_max_replicas,
             blocksize=self.settings.blocksize,
             samplerate=self.settings.samplerate,
@@ -478,11 +513,15 @@ class RenderingCoordinator:
         # paid once per song even though synth/SoundFont session state is still
         # scoped to each GM batch.
         self.gm_pool = ProcessPoolExecutor(
-            max_workers=self.settings.gm_workers,
+            max_workers=self.resources.gm_concurrency,
             mp_context=mp.get_context("spawn"),
         )
-        self.fx_pool = ThreadPoolExecutor(max_workers=int(self.settings.fx_workers or 1), thread_name_prefix="mrp-fx")
-        self.mix_pool = ThreadPoolExecutor(max_workers=self.settings.mix_workers, thread_name_prefix="mrp-mix")
+        self.fx_pool = ThreadPoolExecutor(
+            max_workers=self.resources.fx_concurrency, thread_name_prefix="mrp-fx"
+        )
+        self.mix_pool = ThreadPoolExecutor(
+            max_workers=self.resources.mix_concurrency, thread_name_prefix="mrp-mix"
+        )
 
         self.pending_mix: deque[RenderTask] = deque()
         self.pending_fx: deque[RenderTask] = deque()
@@ -620,15 +659,15 @@ class RenderingCoordinator:
 
     def _backend_cap(self, backend: Backend) -> int:
         if backend == Backend.SFZ:
-            return int(self.settings.sfz_workers or 1)
+            return self.resources.sfz_concurrency
         if backend == Backend.FLUIDSYNTH:
-            return self.settings.gm_workers
+            return self.resources.gm_concurrency
         if backend == Backend.FX:
-            return int(self.settings.fx_workers or 1)
-        return self.settings.mix_workers
+            return self.resources.fx_concurrency
+        return self.resources.mix_concurrency
 
     def _dispatch_ready(self) -> None:
-        while len(self.inflight) < self.settings.workers:
+        while len(self.inflight) < self.resources.concurrency:
             task = self._next_dispatchable_task()
             if task is None:
                 break
@@ -643,7 +682,7 @@ class RenderingCoordinator:
                 return task
 
         fx_backlog = len(self.pending_fx) + self.inflight_by_backend[Backend.FX]
-        blocked = fx_backlog >= int(self.settings.max_fx_backlog or 1)
+        blocked = fx_backlog >= self.resources.max_fx_backlog
         if blocked:
             if not self._backpressure_active and self.logger is not None:
                 self.logger.scheduler(
