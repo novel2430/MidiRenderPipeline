@@ -220,9 +220,37 @@ Build it with:
 make native-lv2
 ```
 
-One stem's complete ordered chain is processed in one helper process.
+One stem's complete ordered chain is processed in one helper process. The native
+host now also supplies the focused URID/options/Atom/Worker subset required by
+modern headless DPF effects such as Dragonfly Reverb. It does not implement a
+DAW transport, UI, MIDI automation, or LV2 state restoration.
+
+Effects that need audible decay after source EOF can set `tail_seconds`; the
+helper renders that exact zero-input tail, and serial-chain tail values are
+summed. Non-zero tails require the native backend. Bundle parents are appended
+to `LV2_PATH`, so bundles do not need to be physically under
+`resources/fx/lv2`.
+
 `lv2apply` is now only an explicit compatibility backend or benchmark reference;
 there is no automatic fallback.
+
+FX routing is no longer inferred from the renderer patch at execution time.
+`StemPlan.effects` is authoritative and combines patch-local tone effects with
+logical post effects:
+
+```toml
+[post_effects]
+drums = ["dragonfly_room"]
+synth_lead = ["dragonfly_plate"]
+melody = ["dragonfly_plate"]
+```
+
+This allows FluidSynth GM and derived stems to use the same FX stage as sfizz.
+Configs without `[post_effects]` retain their previous routing. The checked
+project config intentionally changes the default mix by adding room reverb to
+main drums and plate reverb to synth lead/Melody; `drums_kick_layer` stays dry.
+Patch-local effects still run first, so existing chains such as
+`electric_bass -> gxsvt` are preserved.
 
 ## 9. Resolver and patch-policy migration
 

@@ -11,8 +11,9 @@ tools = "../resources/tools"
 # sfizz_library = "/path/to/libsfizz.so"
 
 # One native process handles a stem's complete LV2 chain in 1024-frame blocks.
-# Effects may still opt into backend = "lv2apply" individually as a legacy
-# compatibility path for plugins outside the supported audio/control-only host.
+# The host supports audio/control ports plus the URID/options/Atom/Worker subset
+# needed by headless modern LV2/DPF effects such as Dragonfly Reverb. Effects
+# may still opt into backend = "lv2apply" individually as a legacy path.
 [effect_renderer]
 backend = "native-lv2"
 tool = "mrp-lv2-chain"
@@ -30,6 +31,15 @@ gain_db = -10.0
 [melody]
 mode = "gm"
 gm_program = 71
+
+# Logical post-FX routing is independent of the RAW backend. Patch-local
+# effects (for example electric_bass -> gxsvt) run first; these post effects
+# are appended afterwards. Unlisted instruments receive no additional post FX.
+# The kick reinforcement layer is intentionally left dry.
+[post_effects]
+drums = ["dragonfly_room"]
+synth_lead = ["dragonfly_plate"]
+melody = ["dragonfly_plate"]
 
 
 # Performance Adapter normalizes source-MIDI velocity semantics before the
@@ -165,7 +175,7 @@ gain_db = 1.0
 [patches.acoustic_guitar]
 library = "mdm_acoustic"
 sfz = "MDMAG Sustain Pick F.sfz"
-gain_db = -6.0
+gain_db = -3.0
 
 [patches.electric_bass]
 library = "fashionbass"
@@ -393,6 +403,63 @@ synth_fx = 96
 ethnic = 104
 percussion = 114
 sound_fx = 120
+
+# Dragonfly 3.2.10 is stored outside resources/fx/lv2, so these bundle paths
+# intentionally use ../.  The native chain host adds bundle parent directories
+# to LV2_PATH for discovery.  tail_seconds is deterministic zero-input render
+# time appended after the source ends. Logical routing is configured separately
+# in [post_effects], so effect definitions remain reusable across RAW backends.
+# Small Drum Room from Dragonfly 3.2.10, written explicitly so offline
+# rendering does not depend on plugin preset/state restoration.
+[effects.dragonfly_room]
+bundle = "../dragonfly-reverb-3.2.10/DragonflyRoomReverb.lv2"
+plugin_uri = "urn:dragonfly:room"
+input_channels = 2
+tail_seconds = 1.5
+
+[effects.dragonfly_room.params]
+dry_level = 80.0
+early_level = 10.0
+early_send = 20.0
+late_level = 20.0
+size = 9.0
+width = 90.0
+predelay = 8.0
+decay = 0.2
+diffuse = 24.0
+spin = 2.1
+wander = 10.0
+in_high_cut = 16000.0
+early_damp = 8200.0
+late_damp = 7000.0
+low_boost = 40.0
+boost_freq = 400.0
+in_low_cut = 4.0
+
+# Clear Plate-style lead space: short enough to preserve articulation, with the
+# full stereo I/O declared by Dragonfly Plate 3.2.10.
+[effects.dragonfly_plate]
+bundle = "../dragonfly-reverb-3.2.10/DragonflyPlateReverb.lv2"
+plugin_uri = "urn:dragonfly:plate"
+input_channels = 2
+tail_seconds = 2.5
+
+[effects.dragonfly_plate.params]
+dry_level = 90.0
+early_level = 10.0
+algorithm = 1
+width = 90.0
+predelay = 0.0
+decay = 0.6
+low_cut = 100.0
+high_cut = 10000.0
+early_damp = 7000.0
+
+[effects.dragonfly_hall]
+bundle = "../dragonfly-reverb-3.2.10/DragonflyHallReverb.lv2"
+plugin_uri = "https://github.com/michaelwillis/dragonfly-reverb"
+input_channels = 2
+tail_seconds = 3.0
 
 # Bass and guitar effects use the project native block-based LV2 chain host.
 # GxSVT contains its own cabinet stage, so CABSWITCH stays enabled rather than

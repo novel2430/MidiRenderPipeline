@@ -5,7 +5,7 @@ NATIVE_LV2_CFLAGS ?= -O3 -DNDEBUG -std=c11 -Wall -Wextra -Wpedantic
 NATIVE_SFIZZ_CXXFLAGS ?= -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic
 NATIVE_LV2_SRC := tools/mrp_lv2_chain.c
 NATIVE_LV2_BIN := resources/tools/mrp-lv2-chain
-NATIVE_LV2_PKGS := lilv-0 sndfile
+NATIVE_LV2_PKGS := lilv-0 sndfile lv2
 NATIVE_SFIZZ_DIR := tools/mrp_sfizz_worker
 NATIVE_SFIZZ_SRC := \
 	$(NATIVE_SFIZZ_DIR)/worker.cpp \
@@ -24,7 +24,7 @@ native-lv2: $(NATIVE_LV2_BIN)
 $(NATIVE_LV2_BIN): $(NATIVE_LV2_SRC)
 	@$(PKG_CONFIG) --exists $(NATIVE_LV2_PKGS) || { \
 		echo "Missing native LV2 build dependencies: $(NATIVE_LV2_PKGS)" >&2; \
-		echo "Void: sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel" >&2; \
+		echo "Void: sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel lv2-devel" >&2; \
 		exit 1; \
 	}
 	@mkdir -p $(dir $@)

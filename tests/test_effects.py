@@ -15,15 +15,18 @@ def _make_registry(tmp_path: Path, *, backend: str = "native-lv2") -> PatchRegis
     config_dir = tmp_path / "config"
     instruments = tmp_path / "instruments" / "ui"
     lv2 = tmp_path / "lv2"
+    dragonfly = tmp_path / "dragonfly"
     tools = tmp_path / "tools"
     config_dir.mkdir()
     instruments.mkdir(parents=True)
     lv2.mkdir()
+    dragonfly.mkdir()
     tools.mkdir()
 
     (instruments / "guitar.sfz").write_text("// test\n")
     for name in ("mono.lv2", "stereo.lv2", "bass.lv2"):
         (lv2 / name).mkdir()
+    (dragonfly / "Room.lv2").mkdir()
     for name in ("mrp-lv2-chain", "lv2apply"):
         tool = tools / name
         tool.write_text("#!/bin/sh\n")
@@ -55,6 +58,11 @@ library = "ui"
 sfz = "guitar.sfz"
 effects = ["bass_amp"]
 
+[patches.reverb_test]
+library = "ui"
+sfz = "guitar.sfz"
+effects = ["room"]
+
 [effects.mono_amp]
 bundle = "mono.lv2"
 plugin_uri = "urn:test:mono"
@@ -82,6 +90,12 @@ input_channels = 1
 BYPASS = 1.0
 GAIN = 0.25
 MODE = 1
+
+[effects.room]
+bundle = "../dragonfly/Room.lv2"
+plugin_uri = "urn:dragonfly:room"
+input_channels = 2
+tail_seconds = 1.5
 """.strip()
         + "\n"
     )
@@ -199,3 +213,80 @@ def test_explicit_legacy_lv2apply_backend_still_runs_stage_by_stage(monkeypatch,
     assert second_cmd[-1] == "urn:test:stereo"
     assert first_env["LV2_PATH"] == str(registry.lv2_root)
     assert second_env["LV2_PATH"] == str(registry.lv2_root)
+
+def test_native_lv2_chain_passes_deterministic_tail_and_bundle_search_root(
+    monkeypatch, tmp_path: Path
+):
+    registry = _make_registry(tmp_path)
+    raw = tmp_path / "raw.wav"
+    sf.write(raw, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
+    stem = _stem(registry, "reverb_test", raw)
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(cmd, *, env, **kwargs):
+        output = Path(cmd[cmd.index("-o") + 1])
+        shutil.copyfile(raw, output)
+        calls.append((list(cmd), dict(env)))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(effects.subprocess, "run", fake_run)
+
+    effects.process_stem_effects(stem, registry, tmp_path / "work")
+
+    assert len(calls) == 1
+    cmd, env = calls[0]
+    assert cmd[cmd.index("--tail-seconds") + 1] == "1.5"
+    search_path = cmd[cmd.index("--lv2-path") + 1]
+    assert search_path.split(effects.os.pathsep) == [
+        str(registry.lv2_root),
+        str((tmp_path / "dragonfly").resolve()),
+    ]
+    assert env["LV2_PATH"] == search_path
+
+
+def test_legacy_lv2apply_rejects_tail_seconds(monkeypatch, tmp_path: Path):
+    registry = _make_registry(tmp_path, backend="lv2apply")
+    raw = tmp_path / "raw.wav"
+    sf.write(raw, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
+    stem = _stem(registry, "reverb_test", raw)
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("lv2apply must not silently drop a configured FX tail")
+
+    monkeypatch.setattr(effects.subprocess, "run", must_not_run)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="tail_seconds requires the native-lv2 backend"):
+        effects.process_stem_effects(stem, registry, tmp_path / "work")
+
+
+def test_explicit_logical_chain_uses_instrument_unique_fx_outputs(monkeypatch, tmp_path: Path):
+    registry = _make_registry(tmp_path)
+    raw = tmp_path / "raw.wav"
+    sf.write(raw, np.ones((64, 2), dtype=np.float32) * 0.1, 48_000, subtype="FLOAT")
+    guitar = _stem(registry, "electric_guitar_clean", raw)
+    bass = _stem(registry, "electric_bass", raw)
+
+    outputs: list[Path] = []
+
+    def fake_run(cmd, *, env, **kwargs):
+        output = Path(cmd[cmd.index("-o") + 1])
+        shutil.copyfile(raw, output)
+        outputs.append(output)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(effects.subprocess, "run", fake_run)
+
+    guitar_out = effects.process_stem_effects(
+        guitar, registry, tmp_path / "work", effect_names=("room",)
+    )
+    bass_out = effects.process_stem_effects(
+        bass, registry, tmp_path / "work", effect_names=("room",)
+    )
+
+    assert guitar_out != bass_out
+    assert guitar_out.name == "track-02.electric_guitar_clean.lv2-chain.wav"
+    assert bass_out.name == "track-02.electric_bass.lv2-chain.wav"
+    assert outputs == [guitar_out, bass_out]

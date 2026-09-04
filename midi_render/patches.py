@@ -223,6 +223,26 @@ class PatchRegistry:
                 enabled=bool(cfg.get("enabled", True)),
             )
 
+        post_effects_cfg = self.data.get("post_effects", {})
+        if not isinstance(post_effects_cfg, dict):
+            raise ValueError("post_effects must be a table")
+        configured_effects = self.data.get("effects", {})
+        if not isinstance(configured_effects, dict):
+            raise ValueError("effects must be a table")
+        self.post_effects: dict[str, tuple[str, ...]] = {}
+        for instrument, names in post_effects_cfg.items():
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise ValueError(
+                    f"post_effects for {instrument!r} must be an array of effect names"
+                )
+            chain = tuple(str(name) for name in names)
+            for effect_name in chain:
+                if effect_name not in configured_effects:
+                    raise ValueError(
+                        f"post_effects for {instrument!r} refers to unknown effect {effect_name!r}"
+                    )
+            self.post_effects[str(instrument)] = chain
+
         self.family_fallbacks: dict[str, str] = {
             str(instrument): str(patch_name)
             for instrument, patch_name in self.data.get("family_fallbacks", {}).items()
@@ -315,6 +335,18 @@ class PatchRegistry:
             raise FileNotFoundError(f"SFZ not found for {instrument}: {patch.sfz}")
         return patch
 
+    def post_effects_for(self, instrument: str) -> tuple[str, ...]:
+        return self.post_effects.get(instrument, ())
+
+    def stem_effects(self, instrument: str, patch: Patch) -> tuple[str, ...]:
+        """Return the ordered FX chain for one logical stem.
+
+        Patch-local effects shape the source timbre first. Logical post-effects
+        are then appended independently of whether RAW came from sfizz,
+        FluidSynth, a derived stem, or a future backend.
+        """
+        return patch.effects + self.post_effects_for(instrument)
+
     def effect(self, name: str) -> EffectConfig:
         cfg = self.data.get("effects", {}).get(name)
         if cfg is None:
@@ -354,6 +386,9 @@ class PatchRegistry:
             f"fx-host  OK       backend={self.effect_renderer.backend} "
             f"tool={self.effect_renderer.tool} block={self.effect_renderer.block_size}",
         ]
+        for instrument, effects in sorted(self.post_effects.items()):
+            chain = " -> ".join(effects) if effects else "<dry>"
+            lines.append(f"post-fx  OK       {instrument:24s}  {chain}")
         for name, profile in sorted(self.performance_profiles.items()):
             lines.append(
                 f"profile  OK       {name:24s}  "

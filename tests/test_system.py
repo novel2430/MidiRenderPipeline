@@ -172,3 +172,31 @@ def test_resource_policy_advanced_overrides_are_clamped_to_global_budget():
     assert policy.fx_concurrency == 2
     assert policy.mix_concurrency == 6
     assert policy.max_fx_backlog == 7
+
+
+def test_cached_raw_routes_fx_from_stem_plan_not_patch(tmp_path: Path):
+    plan = _cached_plan(tmp_path, "cached-post-fx")
+    original = plan.stems[0]
+    plan.stems = (
+        StemPlan(
+            original.stem_id,
+            original.track_index,
+            original.instrument,
+            original.raw_backend,
+            original.raw_output,
+            ("logical_room",),
+        ),
+    )
+    assert plan.cached_stems[0].patch.effects == ()
+
+    coordinator = RenderingCoordinator(plan.settings)
+    try:
+        coordinator._admit(plan)
+        assert len(coordinator.pending_fx) == 1
+        task = coordinator.pending_fx[0]
+        assert task.stem_ids == (original.stem_id,)
+        assert task.payload.effects == ("logical_room",)
+        assert coordinator._task_label(task).endswith("logical_room")
+        assert original.stem_id not in coordinator.active[plan.song_id].processed
+    finally:
+        coordinator.close()

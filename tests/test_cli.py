@@ -189,6 +189,26 @@ gain_db = -6.0
     return config
 
 
+def test_derived_kick_layer_can_receive_logical_post_effects(tmp_path: Path):
+    midi = tmp_path / "drums-derived-post-fx.mid"
+    _make_drum_midi(midi)
+    config = _make_drum_layer_config(tmp_path)
+    _append = (
+        "\n[post_effects]\n"
+        'drums_kick_layer = ["kick_fx"]\n'
+        "\n[effects.kick_fx]\n"
+        'plugin_uri = "urn:test:kick"\n'
+        "input_channels = 2\n"
+    )
+    with config.open("a") as f:
+        f.write(_append)
+
+    plan, _jobs = _planned_raw_jobs(midi, config, tmp_path / "work-derived-post-fx")
+    effects_by_instrument = {stem.instrument: stem.effects for stem in plan.stems}
+    assert effects_by_instrument["drums"] == ()
+    assert effects_by_instrument["drums_kick_layer"] == ("kick_fx",)
+
+
 def test_single_drum_track_reuses_main_and_kick_cache_and_exports_submix(monkeypatch, tmp_path: Path):
     midi = tmp_path / "song.mid"
     _make_drum_midi(midi)
@@ -252,6 +272,17 @@ synth_lead = 80
         + "\n"
     )
     return config
+
+
+def _append_post_effect(config: Path, instrument: str, effect: str = "plate") -> None:
+    with config.open("a") as f:
+        f.write(
+            "\n[post_effects]\n"
+            f'{instrument} = ["{effect}"]\n'
+            f"\n[effects.{effect}]\n"
+            f'plugin_uri = "urn:test:{effect}"\n'
+            "input_channels = 2\n"
+        )
 
 
 def _make_named_program_midi(path: Path, name: str, program: int) -> None:
@@ -335,6 +366,21 @@ def test_trusted_program_is_preserved_for_gm_fallback(monkeypatch, tmp_path: Pat
     assert job.patch.name == "gm_fallback_p082"
     split = mido.MidiFile(job.split_midi).tracks[-1]
     assert {msg.program for msg in split if msg.type == "program_change"} == {82}
+
+
+def test_gm_lead_plan_receives_logical_post_effects(tmp_path: Path):
+    midi = tmp_path / "lead-post-fx.mid"
+    _make_named_program_midi(midi, "Lead", 82)
+    config = _make_gm_fallback_config(tmp_path)
+    _append_post_effect(config, "synth_lead")
+
+    plan, jobs = _planned_raw_jobs(midi, config, tmp_path / "work-lead-post-fx")
+    assert len(jobs) == 1
+    assert jobs[0].instrument == "synth_lead"
+    assert jobs[0].patch.effects == ()
+    assert len(plan.stems) == 1
+    assert plan.stems[0].raw_backend == cli.Backend.FLUIDSYNTH
+    assert plan.stems[0].effects == ("plate",)
 
 
 def test_include_melody_prefers_dedicated_patch_before_gm(monkeypatch, tmp_path: Path):
@@ -466,6 +512,22 @@ def test_melody_gm_mode_can_force_explicit_program(monkeypatch, tmp_path: Path):
     assert job.patch.name == "gm_fallback_p022"
     split = mido.MidiFile(job.split_midi).tracks[-1]
     assert {msg.program for msg in split if msg.type == "program_change"} == {22}
+
+
+def test_melody_gm_plan_receives_logical_post_effects(tmp_path: Path):
+    midi = tmp_path / "melody-post-fx.mid"
+    _make_named_program_midi(midi, "Melody", 80)
+    config = _make_melody_policy_config(tmp_path, 'mode = "gm"\ngm_program = 71')
+    _append_post_effect(config, "melody")
+
+    plan, jobs = _planned_raw_jobs(
+        midi, config, tmp_path / "work-melody-post-fx", include_melody=True
+    )
+    assert len(jobs) == 1
+    assert jobs[0].instrument == "melody"
+    assert jobs[0].patch.effects == ()
+    assert plan.stems[0].raw_backend == cli.Backend.FLUIDSYNTH
+    assert plan.stems[0].effects == ("plate",)
 
 
 def test_melody_instrument_mode_forces_dedicated_instrument(monkeypatch, tmp_path: Path):

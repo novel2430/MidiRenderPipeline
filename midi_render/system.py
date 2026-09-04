@@ -371,6 +371,12 @@ class _Runtime:
     failed: bool = False
     error: str | None = None
     mix_queued: bool = False
+    stem_plans: dict[str, StemPlan] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.stem_plans = {stem.stem_id: stem for stem in self.plan.stems}
+        if len(self.stem_plans) != len(self.plan.stems):
+            raise ValueError(f"duplicate stem_id in song plan: {self.plan.song_id}")
 
 
 @dataclass(frozen=True)
@@ -382,6 +388,7 @@ class _GMPayload:
 @dataclass(frozen=True)
 class _FXPayload:
     stem: RenderedStem
+    effects: tuple[str, ...]
     config_path: Path
     work_dir: Path
 
@@ -453,7 +460,11 @@ def _execute_fx(payload: _FXPayload) -> _TaskExecution:
     registry = _worker_registry(payload.config_path)
     diagnostics: list[str] = []
     final = process_stem_effects(
-        payload.stem, registry, payload.work_dir, diagnostics=diagnostics
+        payload.stem,
+        registry,
+        payload.work_dir,
+        effect_names=payload.effects,
+        diagnostics=diagnostics,
     )
     value = MixStem(
         name=f"track-{payload.stem.track.index:02d} {payload.stem.instrument}",
@@ -618,13 +629,23 @@ class RenderingCoordinator:
 
     def _raw_ready(self, runtime: _Runtime, stem: RenderedStem) -> None:
         stem_id = make_stem_id(stem.track.index, stem.instrument)
-        if stem.patch.effects:
+        stem_plan = runtime.stem_plans.get(stem_id)
+        if stem_plan is None:
+            raise RuntimeError(
+                f"rendered stem {stem_id!r} is not present in song plan {runtime.plan.song_id!r}"
+            )
+        if stem_plan.effects:
             task = make_task(
                 runtime.plan.song_id,
                 Stage.FX,
                 Backend.FX,
                 (stem_id,),
-                _FXPayload(stem, runtime.plan.config_path, runtime.plan.work_dir),
+                _FXPayload(
+                    stem,
+                    stem_plan.effects,
+                    runtime.plan.config_path,
+                    runtime.plan.work_dir,
+                ),
             )
             self.pending_fx.append(task)
         else:
@@ -866,7 +887,7 @@ class RenderingCoordinator:
                 tracks = ",".join(f"{job.track.index:02d}" for job in jobs)
                 return f"tracks {tracks} · fluidsynth batch"
         if task.backend == Backend.FX and isinstance(payload, _FXPayload):
-            chain = " → ".join(payload.stem.patch.effects)
+            chain = " → ".join(payload.effects)
             return f"{payload.stem.track.index:02d} {payload.stem.instrument} · {chain}"
         if task.backend == Backend.MIXER and isinstance(payload, _MixPayload):
             return f"{len(payload.stems)} stem{'s' if len(payload.stems) != 1 else ''}"

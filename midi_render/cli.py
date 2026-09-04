@@ -606,7 +606,7 @@ def _build_song_plan(
                     instrument=render_instrument,
                     raw_backend=Backend.SFZ,
                     raw_output=stem,
-                    effects=patch.effects,
+                    effects=registry.stem_effects(render_instrument, patch),
                 )
             )
             if reuse_raw and stem.is_file():
@@ -705,7 +705,7 @@ def _build_song_plan(
                     instrument=render_instrument,
                     raw_backend=Backend.FLUIDSYNTH,
                     raw_output=stem,
-                    effects=patch.effects,
+                    effects=registry.stem_effects(render_instrument, patch),
                 )
             )
             if reuse_raw and stem.is_file():
@@ -765,7 +765,7 @@ def _build_song_plan(
                         instrument="drums_kick_layer",
                         raw_backend=Backend.SFZ,
                         raw_output=kick_stem,
-                        effects=(),
+                        effects=registry.stem_effects("drums_kick_layer", kick_patch),
                     )
                 )
                 if reuse_raw and kick_stem.is_file():

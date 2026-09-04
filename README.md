@@ -97,10 +97,10 @@ resources/tools/mrp-sfizz-worker
 resources/tools/mrp-lv2-chain
 ```
 
-The LV2 host requires Lilv and libsndfile development packages. On Void Linux:
+The LV2 host requires Lilv, libsndfile, and LV2 development headers. On Void Linux:
 
 ```bash
-sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel
+sudo xbps-install -S base-devel pkg-config lilv-devel libsndfile-devel lv2-devel
 make native-lv2
 ```
 
@@ -169,19 +169,51 @@ The default effect backend is the project-native `mrp-lv2-chain` host. One
 helper process receives a stem's complete ordered chain; audio is processed in
 1024-frame blocks and intermediate stages remain in memory.
 
-The production host supports the audio/control-port layout used by the current
-project-local Guitarix effects. An individual effect may explicitly select
-`backend = "lv2apply"` as a compatibility path; there is no silent runtime
-fallback.
+The production host is a focused headless/offline LV2 host rather than a DAW.
+It supports audio/control ports plus empty Atom Sequence ports, URID map/unmap,
+instantiation-time LV2 options, and synchronous LV2 Worker execution. This is
+enough for the existing Guitarix effects and DPF effects such as Dragonfly
+Reverb without adding UI, transport, MIDI, automation, or state-restore logic.
+An individual effect may explicitly select `backend = "lv2apply"` as a legacy
+compatibility path; there is no silent runtime fallback.
 
-Runtime plugin discovery is tied to:
+The base plugin discovery root remains:
 
 ```text
 resources/fx/lv2
 ```
 
-through `LV2_PATH`, so project-local bundles win over unrelated user-installed
-copies of the same plugins.
+For a configured effect whose bundle lives elsewhere, the bundle's parent
+directory is appended to the helper's `LV2_PATH`. This permits the existing
+`resources/fx/dragonfly-reverb-3.2.10/*.lv2` layout without moving resources.
+Project-local roots are always searched ahead of unrelated user-installed
+copies.
+
+Effects may declare `tail_seconds = N`. The native helper then renders exactly
+that much additional zero-input audio after source EOF so reverb/delay tails are
+not truncated. For a serial chain, configured tail durations are summed. A zero
+or omitted tail preserves the previous output duration exactly. The legacy
+`lv2apply` backend rejects non-zero `tail_seconds` rather than silently dropping
+the tail.
+
+FX routing is logical-stem scoped rather than sampler-backend scoped. Patch-local
+`effects = [...]` remain the source/tone chain and run first; optional
+`[post_effects]` entries are appended afterwards when the `StemPlan` is built.
+The coordinator executes only `StemPlan.effects`, so sfizz, FluidSynth GM,
+derived stems, and future RAW backends all share the same post-FX path.
+
+```toml
+[post_effects]
+drums = ["dragonfly_room"]
+synth_lead = ["dragonfly_plate"]
+melody = ["dragonfly_plate"]
+```
+
+Unlisted instruments receive no additional post FX. In the checked configuration the main drum
+stem receives Dragonfly Room while the derived `drums_kick_layer` intentionally
+remains dry; GM synth lead and GM Melody receive Dragonfly Plate. Dragonfly
+Room/Plate controls are written explicitly in the config rather than depending
+on LV2 preset/state restoration.
 
 `tools/bench_mrp_lv2_chain.py` remains available for A/B benchmarking against
 legacy `lv2apply`.

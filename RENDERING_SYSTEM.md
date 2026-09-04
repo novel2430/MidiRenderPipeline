@@ -27,13 +27,25 @@ MIDI
 Backend batching therefore remains an execution optimization and does not leak
 into the logical song model.
 
+`StemPlan.effects` is the sole FX-routing authority. Planning builds it as:
+
+```text
+patch-local effects -> logical post effects
+```
+
+Patch-local effects preserve sampler/tone policy such as `electric_bass ->
+gxsvt`. Logical post effects come from `[post_effects]` and are independent of
+RAW backend, so an sfizz stem, FluidSynth GM stem, or derived stem can all enter
+the same FX stage. The coordinator never re-derives routing from
+`RenderedStem.patch.effects`.
+
 ## 2. State transitions
 
 ```text
 PLANNED
   -> RAW_PENDING
   -> RAW_READY
-  -> FX_PENDING        only when the patch has effects
+  -> FX_PENDING        only when StemPlan.effects is non-empty
   -> PROCESSED_READY
   -> MIX_PENDING
   -> DONE
@@ -92,7 +104,20 @@ FluidSynth internal `synth.cpu-cores` remains 1.
 ### FX
 
 FX tasks are supervised by a thread pool. The project-native `mrp-lv2-chain`
-child process owns the complete ordered effect chain for one stem.
+child process owns the complete ordered effect chain for one stem. The helper is
+a focused offline LV2 host: audio/control + Atom Sequence ports, URID/options,
+and synchronous Worker scheduling are supported; UI/transport/MIDI/state restore
+remain intentionally out of scope.
+
+A configured effect may add deterministic `tail_seconds`. After source EOF the
+helper continues running the complete chain on zero input for the summed chain
+tail, preserving reverb/delay decay without introducing an adaptive stop rule.
+Existing effects omit the field and therefore retain byte-duration semantics.
+Configured bundle-parent directories are added to the project-local LV2 search
+path, allowing effects outside `resources/fx/lv2` to remain in place. FX work
+files include both track index and logical instrument in their names, preventing
+collisions when multiple derived stems from one MIDI track are processed in
+parallel.
 
 ### MIX
 

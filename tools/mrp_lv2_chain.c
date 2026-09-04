@@ -1,7 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <lilv/lilv.h>
+#include <lv2/atom/atom.h>
+#include <lv2/buf-size/buf-size.h>
 #include <lv2/core/lv2.h>
+#include <lv2/options/options.h>
+#include <lv2/parameters/parameters.h>
+#include <lv2/urid/urid.h>
+#include <lv2/worker/worker.h>
 #include <sndfile.h>
 
 #include <errno.h>
@@ -19,22 +25,24 @@
  *
  * Small offline LV2-chain host for MidiRenderPipeline.
  *
- * Scope is intentionally narrow and mirrors what the current project uses:
- *   - audio ports
- *   - float control ports
- *   - static controls (no automation)
- *   - optional unsupported ports may be left disconnected
+ * Scope is intentionally focused on deterministic headless/offline effects:
+ *   - audio and float control ports
+ *   - Atom Sequence ports with empty host event streams
+ *   - URID map/unmap and instantiation-time LV2 options
+ *   - synchronous LV2 Worker execution for offline rendering
+ *   - static controls (no automation, MIDI, transport, UI, or state restore)
  *   - mono/stereo channel adaptation between stages
- *   - block-based libsndfile I/O
+ *   - block-based libsndfile I/O with an explicit deterministic FX tail
  *
- * It is NOT intended to be a general-purpose LV2 host. Plugins that require
- * Atom/MIDI/Worker/URID/options/state/etc. features may not instantiate. The
- * current project-local Guitarix audio/control plugins are the supported scope.
+ * It is NOT intended to be a general-purpose DAW host. The feature subset is
+ * deliberately sufficient for project-local Guitarix effects and modern DPF
+ * effects such as Dragonfly Reverb while keeping execution single-threaded.
  */
 
 #define MAX_STAGES 32U
 #define MAX_AUDIO_CHANNELS 8U
 #define DEFAULT_BLOCK_SIZE 1024U
+#define DEFAULT_ATOM_BUFFER_SIZE 65536U
 
 typedef struct {
     char *symbol;
@@ -52,7 +60,28 @@ typedef enum {
     PORT_UNSUPPORTED = 0,
     PORT_CONTROL,
     PORT_AUDIO,
+    PORT_ATOM,
 } PortKind;
+
+typedef struct {
+    char **uris;
+    size_t count;
+    size_t capacity;
+} UridMapState;
+
+typedef struct {
+    void *data;
+    uint32_t size;
+} WorkerResponse;
+
+typedef struct {
+    LilvInstance *instance;
+    const LV2_Worker_Interface *interface;
+    LV2_Worker_Schedule schedule;
+    WorkerResponse *responses;
+    size_t n_responses;
+    size_t response_capacity;
+} WorkerBridge;
 
 typedef struct {
     const LilvPort *lilv_port;
@@ -61,12 +90,36 @@ typedef struct {
     float value;
     bool is_input;
     bool optional;
+    uint8_t *atom_buffer;
+    uint32_t atom_capacity;
 } PortInfo;
+
+typedef struct {
+    UridMapState urids;
+    LV2_URID_Map urid_map;
+    LV2_URID_Unmap urid_unmap;
+    LV2_Options_Option options[6];
+    LV2_Feature feature_map;
+    LV2_Feature feature_unmap;
+    LV2_Feature feature_options;
+    LV2_Feature feature_bounded_block;
+    int32_t min_block_length;
+    int32_t max_block_length;
+    int32_t nominal_block_length;
+    int32_t sequence_size;
+    float sample_rate;
+    LV2_URID atom_int;
+    LV2_URID atom_float;
+    LV2_URID atom_sequence;
+} HostFeatures;
 
 typedef struct {
     StageSpec spec;
     const LilvPlugin *plugin;
     LilvInstance *instance;
+    bool activated;
+    HostFeatures *host_features;
+    WorkerBridge worker;
 
     PortInfo *ports;
     uint32_t n_ports;
@@ -85,6 +138,7 @@ typedef struct {
     LilvNode *output_port;
     LilvNode *audio_port;
     LilvNode *control_port;
+    LilvNode *atom_port;
     LilvNode *connection_optional;
 } HostNodes;
 
@@ -93,6 +147,7 @@ typedef struct {
     const char *output_path;
     const char *lv2_path;
     unsigned block_size;
+    double tail_seconds;
     StageSpec stages[MAX_STAGES];
     unsigned n_stages;
 } Options;
@@ -117,6 +172,7 @@ usage(FILE *out, const char *argv0)
             "  -i, --input PATH             Input WAV/audio file\n"
             "  -o, --output PATH            Output WAV/audio file\n"
             "  -b, --block N                Processing block size (default: %u)\n"
+            "      --tail-seconds SEC       Append SEC seconds of zero-input FX tail\n"
             "      --lv2-path PATH          Override LV2_PATH before discovery\n"
             "  -p, --plugin URI             Append an LV2 plugin stage\n"
             "      --input-channels N       Stage pre-conversion channels;\n"
@@ -178,6 +234,19 @@ parse_unsigned(const char *text, unsigned *value)
     return true;
 }
 
+static bool
+parse_nonnegative_double(const char *text, double *value)
+{
+    char *end = NULL;
+    errno = 0;
+    const double n = strtod(text, &end);
+    if (errno || !end || *end != '\0' || !isfinite(n) || n < 0.0) {
+        return false;
+    }
+    *value = n;
+    return true;
+}
+
 static int
 append_control(StageSpec *stage, const char *symbol, const char *value_text)
 {
@@ -202,6 +271,7 @@ parse_options(int argc, char **argv, Options *opts)
     enum {
         OPT_LV2_PATH = 1000,
         OPT_INPUT_CHANNELS,
+        OPT_TAIL_SECONDS,
     };
 
     static const struct option long_options[] = {
@@ -212,6 +282,7 @@ parse_options(int argc, char **argv, Options *opts)
         {"control", required_argument, NULL, 'c'},
         {"lv2-path", required_argument, NULL, OPT_LV2_PATH},
         {"input-channels", required_argument, NULL, OPT_INPUT_CHANNELS},
+        {"tail-seconds", required_argument, NULL, OPT_TAIL_SECONDS},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -260,6 +331,12 @@ parse_options(int argc, char **argv, Options *opts)
         }
         case OPT_LV2_PATH:
             opts->lv2_path = optarg;
+            break;
+        case OPT_TAIL_SECONDS:
+            if (!parse_nonnegative_double(optarg, &opts->tail_seconds)) {
+                fprintf(stderr, "error: invalid --tail-seconds '%s'\n", optarg);
+                return 1;
+            }
             break;
         case OPT_INPUT_CHANNELS: {
             if (opts->n_stages == 0) {
@@ -311,6 +388,7 @@ static void
 free_host_nodes(HostNodes *nodes)
 {
     lilv_node_free(nodes->connection_optional);
+    lilv_node_free(nodes->atom_port);
     lilv_node_free(nodes->control_port);
     lilv_node_free(nodes->audio_port);
     lilv_node_free(nodes->output_port);
@@ -325,9 +403,94 @@ make_host_nodes(LilvWorld *world)
         .output_port = lilv_new_uri(world, LV2_CORE__OutputPort),
         .audio_port = lilv_new_uri(world, LV2_CORE__AudioPort),
         .control_port = lilv_new_uri(world, LV2_CORE__ControlPort),
+        .atom_port = lilv_new_uri(world, LV2_ATOM__AtomPort),
         .connection_optional = lilv_new_uri(world, LV2_CORE__connectionOptional),
     };
     return nodes;
+}
+
+static LV2_URID
+host_map_uri(LV2_URID_Map_Handle handle, const char *uri)
+{
+    UridMapState *state = (UridMapState *)handle;
+    if (!uri) {
+        return 0;
+    }
+    for (size_t i = 0; i < state->count; ++i) {
+        if (strcmp(state->uris[i], uri) == 0) {
+            return (LV2_URID)(i + 1U);
+        }
+    }
+    if (state->count == state->capacity) {
+        const size_t next = state->capacity ? state->capacity * 2U : 32U;
+        state->uris = xrealloc(state->uris, next * sizeof(char *));
+        state->capacity = next;
+    }
+    state->uris[state->count] = xstrdup(uri);
+    ++state->count;
+    return (LV2_URID)state->count;
+}
+
+static const char *
+host_unmap_uri(LV2_URID_Unmap_Handle handle, LV2_URID urid)
+{
+    UridMapState *state = (UridMapState *)handle;
+    if (urid == 0 || (size_t)urid > state->count) {
+        return NULL;
+    }
+    return state->uris[urid - 1U];
+}
+
+static void
+free_host_features(HostFeatures *host)
+{
+    for (size_t i = 0; i < host->urids.count; ++i) {
+        free(host->urids.uris[i]);
+    }
+    free(host->urids.uris);
+    memset(host, 0, sizeof(*host));
+}
+
+static void
+init_host_features(HostFeatures *host, unsigned block_size, unsigned sample_rate)
+{
+    memset(host, 0, sizeof(*host));
+    host->urid_map.handle = &host->urids;
+    host->urid_map.map = host_map_uri;
+    host->urid_unmap.handle = &host->urids;
+    host->urid_unmap.unmap = host_unmap_uri;
+
+    host->atom_int = host_map_uri(&host->urids, LV2_ATOM__Int);
+    host->atom_float = host_map_uri(&host->urids, LV2_ATOM__Float);
+    host->atom_sequence = host_map_uri(&host->urids, LV2_ATOM__Sequence);
+
+    host->min_block_length = 1;
+    host->max_block_length = (int32_t)block_size;
+    host->nominal_block_length = (int32_t)block_size;
+    host->sequence_size = (int32_t)DEFAULT_ATOM_BUFFER_SIZE;
+    host->sample_rate = (float)sample_rate;
+
+    host->options[0] = (LV2_Options_Option){
+        LV2_OPTIONS_INSTANCE, 0, host_map_uri(&host->urids, LV2_BUF_SIZE__minBlockLength),
+        sizeof(int32_t), host->atom_int, &host->min_block_length};
+    host->options[1] = (LV2_Options_Option){
+        LV2_OPTIONS_INSTANCE, 0, host_map_uri(&host->urids, LV2_BUF_SIZE__maxBlockLength),
+        sizeof(int32_t), host->atom_int, &host->max_block_length};
+    host->options[2] = (LV2_Options_Option){
+        LV2_OPTIONS_INSTANCE, 0, host_map_uri(&host->urids, LV2_BUF_SIZE__nominalBlockLength),
+        sizeof(int32_t), host->atom_int, &host->nominal_block_length};
+    host->options[3] = (LV2_Options_Option){
+        LV2_OPTIONS_INSTANCE, 0, host_map_uri(&host->urids, LV2_BUF_SIZE__sequenceSize),
+        sizeof(int32_t), host->atom_int, &host->sequence_size};
+    host->options[4] = (LV2_Options_Option){
+        LV2_OPTIONS_INSTANCE, 0, host_map_uri(&host->urids, LV2_PARAMETERS__sampleRate),
+        sizeof(float), host->atom_float, &host->sample_rate};
+    host->options[5] = (LV2_Options_Option){0};
+
+    host->feature_map = (LV2_Feature){LV2_URID__map, &host->urid_map};
+    host->feature_unmap = (LV2_Feature){LV2_URID__unmap, &host->urid_unmap};
+    host->feature_options = (LV2_Feature){LV2_OPTIONS__options, host->options};
+    host->feature_bounded_block = (LV2_Feature){LV2_BUF_SIZE__boundedBlockLength, NULL};
 }
 
 static void
@@ -353,11 +516,166 @@ alloc_planar(unsigned n_channels, unsigned block_size)
 }
 
 static void
+free_worker_responses(WorkerBridge *worker)
+{
+    for (size_t i = 0; i < worker->n_responses; ++i) {
+        free(worker->responses[i].data);
+    }
+    free(worker->responses);
+    worker->responses = NULL;
+    worker->n_responses = 0;
+    worker->response_capacity = 0;
+}
+
+static LV2_Worker_Status
+worker_respond(LV2_Worker_Respond_Handle handle, uint32_t size, const void *data)
+{
+    WorkerBridge *worker = (WorkerBridge *)handle;
+    if (worker->n_responses == worker->response_capacity) {
+        const size_t next = worker->response_capacity ? worker->response_capacity * 2U : 4U;
+        worker->responses = xrealloc(worker->responses, next * sizeof(WorkerResponse));
+        worker->response_capacity = next;
+    }
+    WorkerResponse *response = &worker->responses[worker->n_responses++];
+    response->size = size;
+    response->data = NULL;
+    if (size > 0) {
+        response->data = xcalloc(size, 1U);
+        memcpy(response->data, data, size);
+    }
+    return LV2_WORKER_SUCCESS;
+}
+
+static LV2_Worker_Status
+worker_schedule(LV2_Worker_Schedule_Handle handle, uint32_t size, const void *data)
+{
+    WorkerBridge *worker = (WorkerBridge *)handle;
+    if (!worker->instance || !worker->interface || !worker->interface->work) {
+        return LV2_WORKER_ERR_UNKNOWN;
+    }
+    return worker->interface->work(
+        lilv_instance_get_handle(worker->instance), worker_respond, worker, size, data);
+}
+
+static int
+worker_finish_cycle(WorkerBridge *worker)
+{
+    if (!worker->interface || !worker->instance) {
+        return 0;
+    }
+    LV2_Handle handle = lilv_instance_get_handle(worker->instance);
+    size_t i = 0;
+    while (i < worker->n_responses) {
+        WorkerResponse *response = &worker->responses[i++];
+        if (worker->interface->work_response) {
+            const LV2_Worker_Status status = worker->interface->work_response(
+                handle, response->size, response->data);
+            if (status != LV2_WORKER_SUCCESS) {
+                fprintf(stderr, "error: LV2 worker response failed with status %d\n", (int)status);
+                free_worker_responses(worker);
+                return 1;
+            }
+        }
+    }
+    free_worker_responses(worker);
+    if (worker->interface->end_run) {
+        const LV2_Worker_Status status = worker->interface->end_run(handle);
+        if (status != LV2_WORKER_SUCCESS) {
+            fprintf(stderr, "error: LV2 worker end_run failed with status %d\n", (int)status);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void
+reset_atom_ports(Stage *stage)
+{
+    for (uint32_t p = 0; p < stage->n_ports; ++p) {
+        PortInfo *info = &stage->ports[p];
+        if (info->kind != PORT_ATOM || !info->atom_buffer) {
+            continue;
+        }
+        LV2_Atom_Sequence *seq = (LV2_Atom_Sequence *)info->atom_buffer;
+        memset(seq, 0, sizeof(*seq));
+        seq->atom.type = stage->host_features->atom_sequence;
+        seq->body.unit = 0;
+        seq->body.pad = 0;
+        if (info->is_input) {
+            seq->atom.size = sizeof(LV2_Atom_Sequence_Body);
+        } else {
+            seq->atom.size = info->atom_capacity - (uint32_t)sizeof(LV2_Atom);
+        }
+    }
+}
+
+static bool
+supported_required_feature(const char *uri)
+{
+    return uri && (strcmp(uri, LV2_OPTIONS__options) == 0 ||
+                   strcmp(uri, LV2_URID__map) == 0 ||
+                   strcmp(uri, LV2_URID__unmap) == 0 ||
+                   strcmp(uri, LV2_WORKER__schedule) == 0 ||
+                   strcmp(uri, LV2_BUF_SIZE__boundedBlockLength) == 0);
+}
+
+static int
+validate_required_features(const LilvPlugin *plugin, const char *plugin_uri)
+{
+    LilvNodes *required = lilv_plugin_get_required_features(plugin);
+    if (!required) {
+        return 0;
+    }
+    int status = 0;
+    LILV_FOREACH(nodes, i, required) {
+        const LilvNode *node = lilv_nodes_get(required, i);
+        const char *uri = lilv_node_as_uri(node);
+        if (!supported_required_feature(uri)) {
+            fprintf(stderr,
+                    "error: <%s> requires unsupported LV2 host feature <%s>\n",
+                    plugin_uri,
+                    uri ? uri : "non-URI feature");
+            status = 1;
+            break;
+        }
+    }
+    lilv_nodes_free(required);
+    return status;
+}
+
+static bool
+plugin_requires_feature(const LilvPlugin *plugin, const char *feature_uri)
+{
+    LilvNodes *required = lilv_plugin_get_required_features(plugin);
+    if (!required) {
+        return false;
+    }
+    bool found = false;
+    LILV_FOREACH(nodes, i, required) {
+        const char *uri = lilv_node_as_uri(lilv_nodes_get(required, i));
+        if (uri && strcmp(uri, feature_uri) == 0) {
+            found = true;
+            break;
+        }
+    }
+    lilv_nodes_free(required);
+    return found;
+}
+
+static void
 free_stage(Stage *stage)
 {
     if (stage->instance) {
-        lilv_instance_deactivate(stage->instance);
+        if (stage->activated) {
+            lilv_instance_deactivate(stage->instance);
+        }
         lilv_instance_free(stage->instance);
+    }
+    free_worker_responses(&stage->worker);
+    if (stage->ports) {
+        for (uint32_t p = 0; p < stage->n_ports; ++p) {
+            free(stage->ports[p].atom_buffer);
+        }
     }
     free_planar(stage->audio_out, stage->n_audio_out);
     free_planar(stage->audio_in, stage->n_audio_in);
@@ -373,11 +691,13 @@ configure_stage(Stage *stage,
                 LilvWorld *world,
                 const LilvPlugins *plugins,
                 const HostNodes *nodes,
+                HostFeatures *host_features,
                 unsigned block_size,
                 unsigned sample_rate)
 {
     memset(stage, 0, sizeof(*stage));
     stage->spec = *spec; /* borrowed strings/control array owned by Options */
+    stage->host_features = host_features;
 
     LilvNode *uri = lilv_new_uri(world, spec->uri);
     if (!uri) {
@@ -388,6 +708,9 @@ configure_stage(Stage *stage,
     lilv_node_free(uri);
     if (!stage->plugin) {
         fprintf(stderr, "error: plugin <%s> not found\n", spec->uri);
+        return 1;
+    }
+    if (validate_required_features(stage->plugin, spec->uri)) {
         return 1;
     }
 
@@ -423,9 +746,13 @@ configure_stage(Stage *stage,
             } else {
                 ++stage->n_audio_out;
             }
+        } else if (lilv_port_is_a(stage->plugin, port, nodes->atom_port)) {
+            info->kind = PORT_ATOM;
+            info->atom_capacity = DEFAULT_ATOM_BUFFER_SIZE;
+            info->atom_buffer = xcalloc(info->atom_capacity, 1U);
         } else if (!info->optional) {
             fprintf(stderr,
-                    "error: <%s> port %u has unsupported required type; MRP host only supports audio/control ports\n",
+                    "error: <%s> port %u has unsupported required type; MRP host supports audio/control/Atom Sequence ports\n",
                     spec->uri,
                     p);
             free(defaults);
@@ -487,11 +814,30 @@ configure_stage(Stage *stage,
     stage->audio_in = alloc_planar(stage->n_audio_in, block_size);
     stage->audio_out = alloc_planar(stage->n_audio_out, block_size);
 
-    /* Match lv2apply's minimal feature policy: no host features. */
-    stage->instance = lilv_plugin_instantiate(stage->plugin, (double)sample_rate, NULL);
+    stage->worker.schedule.handle = &stage->worker;
+    stage->worker.schedule.schedule_work = worker_schedule;
+    const LV2_Feature worker_feature = {LV2_WORKER__schedule, &stage->worker.schedule};
+    const LV2_Feature *features[] = {
+        &host_features->feature_map,
+        &host_features->feature_unmap,
+        &host_features->feature_options,
+        &host_features->feature_bounded_block,
+        &worker_feature,
+        NULL,
+    };
+    stage->instance = lilv_plugin_instantiate(stage->plugin, (double)sample_rate, features);
     if (!stage->instance) {
         fprintf(stderr,
-                "error: failed to instantiate <%s>; plugin may require host features this MRP host does not provide\n",
+                "error: failed to instantiate <%s> with MRP offline host features\n",
+                spec->uri);
+        return 1;
+    }
+    stage->worker.instance = stage->instance;
+    stage->worker.interface = (const LV2_Worker_Interface *)lilv_instance_get_extension_data(
+        stage->instance, LV2_WORKER__interface);
+    if (plugin_requires_feature(stage->plugin, LV2_WORKER__schedule) && !stage->worker.interface) {
+        fprintf(stderr,
+                "error: <%s> requires LV2 Worker scheduling but provides no worker interface\n",
                 spec->uri);
         return 1;
     }
@@ -499,6 +845,8 @@ configure_stage(Stage *stage,
     for (uint32_t p = 0; p < stage->n_ports; ++p) {
         if (stage->ports[p].kind == PORT_CONTROL) {
             lilv_instance_connect_port(stage->instance, p, &stage->ports[p].value);
+        } else if (stage->ports[p].kind == PORT_ATOM) {
+            lilv_instance_connect_port(stage->instance, p, stage->ports[p].atom_buffer);
         } else if (stage->ports[p].kind == PORT_UNSUPPORTED) {
             lilv_instance_connect_port(stage->instance, p, NULL);
         }
@@ -510,8 +858,21 @@ configure_stage(Stage *stage,
         lilv_instance_connect_port(stage->instance, stage->audio_out_ports[ch], stage->audio_out[ch]);
     }
 
+    reset_atom_ports(stage);
     lilv_instance_activate(stage->instance);
+    stage->activated = true;
     return 0;
+}
+
+static int
+run_stage(Stage *stage, uint32_t nframes)
+{
+    reset_atom_ports(stage);
+    for (unsigned ch = 0; ch < stage->n_audio_out; ++ch) {
+        memset(stage->audio_out[ch], 0, (size_t)nframes * sizeof(float));
+    }
+    lilv_instance_run(stage->instance, nframes);
+    return worker_finish_cycle(&stage->worker);
 }
 
 static void
@@ -655,6 +1016,8 @@ main(int argc, char **argv)
 
     const LilvPlugins *plugins = lilv_world_get_all_plugins(world);
     HostNodes nodes = make_host_nodes(world);
+    HostFeatures host_features;
+    init_host_features(&host_features, opts.block_size, (unsigned)in_info.samplerate);
 
     const double setup_t0 = now_seconds();
     Stage *stages = xcalloc(opts.n_stages, sizeof(Stage));
@@ -665,12 +1028,14 @@ main(int argc, char **argv)
                             world,
                             plugins,
                             &nodes,
+                            &host_features,
                             opts.block_size,
                             (unsigned)in_info.samplerate)) {
             for (unsigned i = 0; i <= configured; ++i) {
                 free_stage(&stages[i]);
             }
             free(stages);
+            free_host_features(&host_features);
             free_host_nodes(&nodes);
             lilv_world_free(world);
             sf_close(in_file);
@@ -709,6 +1074,7 @@ main(int argc, char **argv)
             free_stage(&stages[i]);
         }
         free(stages);
+        free_host_features(&host_features);
         free_host_nodes(&nodes);
         lilv_world_free(world);
         sf_close(in_file);
@@ -723,43 +1089,64 @@ main(int argc, char **argv)
     float *mono_scratch = xcalloc(opts.block_size, sizeof(float));
 
     sf_count_t total_frames = 0;
+    sf_count_t tail_frames_written = 0;
     int render_status = 0;
+    const sf_count_t requested_tail_frames =
+        (sf_count_t)ceil(opts.tail_seconds * (double)in_info.samplerate);
     const double render_t0 = now_seconds();
-    for (;;) {
-        const sf_count_t nread = sf_readf_float(in_file, input_interleaved, opts.block_size);
-        if (nread < 0) {
-            fprintf(stderr, "error: failed reading input: %s\n", sf_strerror(in_file));
-            render_status = 1;
-            break;
-        }
-        if (nread == 0) {
-            break;
+    bool input_done = false;
+    while (!input_done || tail_frames_written < requested_tail_frames) {
+        sf_count_t nframes_io = 0;
+        if (!input_done) {
+            nframes_io = sf_readf_float(in_file, input_interleaved, opts.block_size);
+            if (nframes_io < 0) {
+                fprintf(stderr, "error: failed reading input: %s\n", sf_strerror(in_file));
+                render_status = 1;
+                break;
+            }
+            if (nframes_io == 0) {
+                input_done = true;
+                continue;
+            }
+            deinterleave(input_planar, input_interleaved, input_channels, (size_t)nframes_io);
+        } else {
+            const sf_count_t remaining = requested_tail_frames - tail_frames_written;
+            nframes_io = remaining < (sf_count_t)opts.block_size
+                             ? remaining
+                             : (sf_count_t)opts.block_size;
+            for (unsigned ch = 0; ch < input_channels; ++ch) {
+                memset(input_planar[ch], 0, (size_t)nframes_io * sizeof(float));
+            }
         }
 
-        const size_t nframes = (size_t)nread;
-        deinterleave(input_planar, input_interleaved, input_channels, nframes);
-
+        const size_t nframes = (size_t)nframes_io;
         float **current = input_planar;
         unsigned current_channels = input_channels;
 
         for (unsigned s = 0; s < opts.n_stages; ++s) {
             Stage *stage = &stages[s];
             prepare_stage_input(stage, current, current_channels, nframes, mono_scratch);
-            for (unsigned ch = 0; ch < stage->n_audio_out; ++ch) {
-                memset(stage->audio_out[ch], 0, nframes * sizeof(float));
+            if (run_stage(stage, (uint32_t)nframes)) {
+                render_status = 1;
+                break;
             }
-            lilv_instance_run(stage->instance, (uint32_t)nframes);
             current = stage->audio_out;
             current_channels = stage->n_audio_out;
         }
+        if (render_status) {
+            break;
+        }
 
         interleave(output_interleaved, current, output_channels, nframes);
-        if (sf_writef_float(out_file, output_interleaved, nread) != nread) {
+        if (sf_writef_float(out_file, output_interleaved, nframes_io) != nframes_io) {
             fprintf(stderr, "error: failed writing output: %s\n", sf_strerror(out_file));
             render_status = 1;
             break;
         }
-        total_frames += nread;
+        total_frames += nframes_io;
+        if (input_done) {
+            tail_frames_written += nframes_io;
+        }
     }
     const double render_seconds = now_seconds() - render_t0;
 
@@ -779,16 +1166,18 @@ main(int argc, char **argv)
         free_stage(&stages[i]);
     }
     free(stages);
+    free_host_features(&host_features);
     free_host_nodes(&nodes);
     lilv_world_free(world);
 
     const double total_seconds = now_seconds() - total_t0;
     fprintf(stderr,
-            "MRP-LV2: stages=%u block=%u sr=%d frames=%lld world=%.4fs setup=%.4fs render=%.4fs total=%.4fs\n",
+            "MRP-LV2: stages=%u block=%u sr=%d frames=%lld tail=%lld world=%.4fs setup=%.4fs render=%.4fs total=%.4fs\n",
             opts.n_stages,
             opts.block_size,
             in_info.samplerate,
             (long long)total_frames,
+            (long long)tail_frames_written,
             world_seconds,
             setup_seconds,
             render_seconds,

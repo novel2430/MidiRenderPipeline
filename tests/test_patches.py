@@ -60,6 +60,15 @@ def test_current_registry_selects_baked_guitars_and_existing_asset_families():
     assert gm.soundfont.name == "MuseScore_General_Full.sf2"
     assert gm.representative_program("melody") == 80
     assert gm.representative_program("synth_pad") == 89
+    assert registry.post_effects_for("drums") == ("dragonfly_room",)
+    assert registry.post_effects_for("synth_lead") == ("dragonfly_plate",)
+    assert registry.post_effects_for("melody") == ("dragonfly_plate",)
+    assert registry.post_effects_for("drums_kick_layer") == ()
+    bass = registry.get("electric_bass")
+    drums = registry.get("drums")
+    assert bass is not None and drums is not None
+    assert registry.stem_effects("electric_bass", bass) == ("gxsvt",)
+    assert registry.stem_effects("drums", drums) == ("dragonfly_room",)
 
 
 def test_current_active_bass_effect_baseline_uses_native_lv2_chain_uri():
@@ -85,6 +94,11 @@ def test_current_active_bass_effect_baseline_uses_native_lv2_chain_uri():
         "HIGHSWITCH": 0,
         "CABSWITCH": 1,
     }
+    plate = registry.effect("dragonfly_plate").values
+    assert plate["input_channels"] == 2
+    assert plate["params"]["dry_level"] == 80.0
+    assert plate["params"]["early_level"] == 20.0
+    assert plate["params"]["decay"] == 0.6
 
 
 def test_optional_drum_kick_layer_resolves_from_instruments_root(tmp_path: Path):
@@ -291,3 +305,60 @@ velocity_max = 85
         assert "velocity_min" in str(exc)
     else:
         raise AssertionError("invalid performance range should fail")
+
+
+def test_post_effects_append_after_patch_effects_and_validate_names(tmp_path: Path):
+    config_dir = tmp_path / "config-post-fx"
+    instruments = tmp_path / "instruments-post-fx" / "lib"
+    config_dir.mkdir()
+    instruments.mkdir(parents=True)
+    (instruments / "bass.sfz").write_text("// bass\n")
+    config = config_dir / "patches.toml"
+    config.write_text(
+        """
+[paths]
+instruments = "../instruments-post-fx"
+
+[libraries.test]
+root = "lib"
+
+[patches.electric_bass]
+library = "test"
+sfz = "bass.sfz"
+effects = ["amp"]
+
+[post_effects]
+electric_bass = ["room", "limiter"]
+
+[effects.amp]
+plugin_uri = "urn:test:amp"
+
+[effects.room]
+plugin_uri = "urn:test:room"
+
+[effects.limiter]
+plugin_uri = "urn:test:limiter"
+""".strip()
+        + "\n"
+    )
+    registry = PatchRegistry(config)
+    patch = registry.get("electric_bass")
+    assert patch is not None
+    assert registry.stem_effects("electric_bass", patch) == ("amp", "room", "limiter")
+
+    config.write_text(
+        """
+[post_effects]
+synth_lead = ["missing"]
+
+[effects.plate]
+plugin_uri = "urn:test:plate"
+""".strip()
+        + "\n"
+    )
+    try:
+        PatchRegistry(config)
+    except ValueError as exc:
+        assert "unknown effect 'missing'" in str(exc)
+    else:
+        raise AssertionError("unknown post effect should fail during config load")

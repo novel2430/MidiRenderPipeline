@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 import shutil
@@ -69,6 +70,15 @@ def _ensure_channels(source: Path, output: Path, channels: int) -> Path:
     return output
 
 
+def _safe_stem_component(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in value)
+    return safe or "stem"
+
+
+def _stem_fx_prefix(stem: RenderedStem) -> str:
+    return f"track-{stem.track.index:02d}.{_safe_stem_component(stem.instrument)}"
+
+
 def _effect_paths(
     stem: RenderedStem,
     source: Path,
@@ -79,7 +89,7 @@ def _effect_paths(
 ) -> tuple[Path, Path]:
     fx_dir = work_dir / "fx"
     fx_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"track-{stem.track.index:02d}.{stage:02d}-{effect_name}"
+    prefix = f"{_stem_fx_prefix(stem)}.{stage:02d}-{effect_name}"
     prepared = _ensure_channels(
         source,
         fx_dir / f"{prefix}.input-{input_channels}ch.wav",
@@ -102,6 +112,33 @@ def _format_lv2_control(value: object) -> str:
 def _effect_backend(registry: PatchRegistry, effect_name: str) -> str:
     cfg = registry.effect(effect_name).values
     return str(cfg.get("backend", registry.effect_renderer.backend)).strip().lower()
+
+
+def _effect_tail_seconds(registry: PatchRegistry, effect_name: str) -> float:
+    cfg = registry.effect(effect_name).values
+    raw = cfg.get("tail_seconds", 0.0)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise TypeError(f"effect {effect_name!r} tail_seconds must be numeric")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"effect {effect_name!r} tail_seconds must be finite and >= 0")
+    return value
+
+
+def _native_lv2_search_path(
+    registry: PatchRegistry,
+    stages: list[tuple[str, dict[str, object]]],
+) -> str:
+    roots: list[Path] = [registry.lv2_root]
+    for _effect_name, cfg in stages:
+        bundle_value = cfg.get("bundle")
+        if bundle_value is None:
+            continue
+        bundle = registry.resolve_lv2(str(bundle_value))
+        parent = bundle.parent
+        if parent not in roots:
+            roots.append(parent)
+    return os.pathsep.join(str(path) for path in roots)
 
 
 def _run_lv2apply_effect(
@@ -130,6 +167,10 @@ def _run_lv2apply_effect(
     params = cfg.get("params", {})
     if not isinstance(params, dict):
         raise TypeError(f"effect {effect_name!r} params must be a table")
+    if _effect_tail_seconds(registry, effect_name) > 0.0:
+        raise ValueError(
+            f"effect {effect_name!r} tail_seconds requires the native-lv2 backend"
+        )
 
     prepared, output = _effect_paths(
         stem,
@@ -167,9 +208,9 @@ def _run_native_lv2_chain(
     stem: RenderedStem,
     registry: PatchRegistry,
     work_dir: Path,
+    effect_names: tuple[str, ...],
 ) -> tuple[Path, str]:
     """Process one complete LV2 chain in a single block-based native helper."""
-    effect_names = stem.patch.effects
     if not effect_names:
         return stem.path, ""
 
@@ -203,9 +244,11 @@ def _run_native_lv2_chain(
 
     fx_dir = work_dir / "fx"
     fx_dir.mkdir(parents=True, exist_ok=True)
-    output = fx_dir / f"track-{stem.track.index:02d}.lv2-chain.wav"
+    output = fx_dir / f"{_stem_fx_prefix(stem)}.lv2-chain.wav"
     output.unlink(missing_ok=True)
 
+    lv2_path = _native_lv2_search_path(registry, stages)
+    tail_seconds = sum(_effect_tail_seconds(registry, name) for name in effect_names)
     cmd = [
         str(tool),
         "-i",
@@ -215,8 +258,10 @@ def _run_native_lv2_chain(
         "--block",
         str(registry.effect_renderer.block_size),
         "--lv2-path",
-        str(registry.lv2_root),
+        lv2_path,
     ]
+    if tail_seconds > 0.0:
+        cmd.extend(["--tail-seconds", f"{tail_seconds:.9g}"])
     for effect_name, cfg in stages:
         plugin_uri = str(cfg["plugin_uri"])
         input_channels = int(cfg.get("input_channels", 1))
@@ -230,7 +275,7 @@ def _run_native_lv2_chain(
             cmd.extend(["--control", str(name), _format_lv2_control(value)])
 
     env = os.environ.copy()
-    env["LV2_PATH"] = str(registry.lv2_root)
+    env["LV2_PATH"] = lv2_path
 
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -253,29 +298,37 @@ def process_stem_effects(
     registry: PatchRegistry,
     work_dir: Path,
     *,
+    effect_names: tuple[str, ...] | None = None,
     diagnostics: list[str] | None = None,
 ) -> Path:
-    if not stem.patch.effects:
+    """Apply the explicit logical-stem FX chain.
+
+    ``effect_names`` is supplied by ``StemPlan.effects`` in the coordinator.
+    ``None`` retains the pre-Phase-02 patch-local behavior for direct callers
+    and tests that use the effects module independently.
+    """
+    chain = stem.patch.effects if effect_names is None else tuple(effect_names)
+    if not chain:
         return stem.path
 
-    backends = tuple(_effect_backend(registry, name) for name in stem.patch.effects)
+    backends = tuple(_effect_backend(registry, name) for name in chain)
     unique_backends = set(backends)
     if len(unique_backends) != 1:
         raise ValueError(
             "mixed effect backends in one stem are not supported; "
-            f"got {dict(zip(stem.patch.effects, backends))}"
+            f"got {dict(zip(chain, backends))}"
         )
 
     backend = backends[0]
     if backend == NATIVE_LV2_BACKEND:
-        path, detail = _run_native_lv2_chain(stem, registry, work_dir)
+        path, detail = _run_native_lv2_chain(stem, registry, work_dir, chain)
         if diagnostics is not None and detail:
             diagnostics.append(detail)
         return path
 
     if backend == LEGACY_LV2APPLY_BACKEND:
         path = stem.path
-        for stage, effect_name in enumerate(stem.patch.effects, start=1):
+        for stage, effect_name in enumerate(chain, start=1):
             path, detail = _run_lv2apply_effect(
                 stem,
                 path,
