@@ -38,8 +38,8 @@ gm_program = 71
 # The kick reinforcement layer is intentionally left dry.
 [post_effects]
 drums = ["dragonfly_room"]
-synth_lead = ["dragonfly_plate"]
-melody = ["dragonfly_plate"]
+synth_lead = ["lead_eq","dragonfly_plate"]
+melody = ["lead_eq","dragonfly_plate"]
 
 
 # Performance Adapter normalizes source-MIDI velocity semantics before the
@@ -594,6 +594,19 @@ LEVEL = 0.50
 BASS = 0.35
 MID = 0.55
 TREBLE = 0.70
+
+[effects.lead_eq]
+bundle = "../DPF-Plugins-v1.7/3BandEQ.lv2"
+plugin_uri = "http://distrho.sf.net/plugins/3BandEQ"
+input_channels = 2
+
+[effects.lead_eq.params]
+low = -2.0
+mid = 2.0
+high = 1.0
+master = 2.0
+low_mid = 250.0
+mid_high = 3000.0
 
 [drum_kick_layer]
 enabled = true
