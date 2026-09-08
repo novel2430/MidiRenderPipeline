@@ -854,3 +854,58 @@ def test_dynamic_program_on_one_channel_preserves_source_changes_and_forces_gm(t
     assert job.patch.name == "gm_fallback_dynamic"
     split = mido.MidiFile(job.split_midi).tracks[-1]
     assert [msg.program for msg in split if msg.type == "program_change"] == [16, 50]
+
+
+def test_dynamic_program_prefers_representative_sfz_and_strips_program_changes(tmp_path: Path):
+    midi = tmp_path / "dynamic-bass.mid"
+    mid = mido.MidiFile(type=1, ticks_per_beat=480)
+    mid.tracks.append(mido.MidiTrack())
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="bass", time=0))
+    track.append(mido.Message("program_change", channel=0, program=32, time=0))
+    track.append(mido.Message("note_on", channel=0, note=40, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=40, velocity=0, time=480))
+    track.append(mido.Message("program_change", channel=0, program=33, time=0))
+    track.append(mido.Message("note_on", channel=0, note=43, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=43, velocity=0, time=120))
+    mid.tracks.append(track)
+    mid.save(midi)
+
+    config_dir = tmp_path / "config-dynamic-sfz"
+    instruments = tmp_path / "instruments-dynamic-sfz"
+    library = instruments / "bass"
+    config_dir.mkdir()
+    library.mkdir(parents=True)
+    (library / "bass.sfz").write_text("// bass\n")
+    (instruments / "MuseScore_General_Full.sf2").write_bytes(b"sf2")
+    config = config_dir / "patches.toml"
+    config.write_text(
+        """
+[paths]
+instruments = "../instruments-dynamic-sfz"
+
+[libraries.bass]
+root = "bass"
+
+[patches.electric_bass]
+library = "bass"
+sfz = "bass.sfz"
+
+[general_midi_fallback]
+soundfont = "MuseScore_General_Full.sf2"
+synth_gain = 0.2
+""".strip()
+        + "\n"
+    )
+
+    plan, jobs = _planned_raw_jobs(midi, config, tmp_path / "work-dynamic-sfz")
+    assert len(plan.stems) == 1
+    assert plan.stems[0].raw_backend == cli.Backend.SFZ
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.instrument == "electric_bass"
+    assert job.patch.name == "electric_bass"
+    assert job.track.has_dynamic_program is True
+    assert cli.resolve_track(job.track).representative_program == 32
+    split = mido.MidiFile(job.split_midi).tracks[-1]
+    assert [msg for msg in split if msg.type == "program_change"] == []

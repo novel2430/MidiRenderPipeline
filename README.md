@@ -32,17 +32,21 @@ resume, failure, and logging contracts.
 
 ## Rendering assumptions and instrument resolution
 
-MRP deliberately treats **one musical MIDI track as one logical instrument**.
-This is an operational contract rather than a limitation of the MIDI standard.
-The analyzer warns when a track contains multiple programs or multiple note
-channels so exceptions remain visible.
+MRP treats a conventional one-channel musical MIDI track as one logical stem.
+When a physical track carries notes on multiple MIDI channels (common in Type-0
+and internet MIDI), planning expands it into one logical stem per note-bearing
+channel while keeping the original track index for diagnostics and `--track`.
 
 Instrument resolution is **Program-first**:
 
 1. channel-10 percussion is the hard drum special case;
-2. one usable GM Program Change is the primary timbre identity;
-3. track name is fallback metadata when no single usable Program is available;
-4. `Melody` is a dataset role whose rendering policy is configured separately.
+2. Program Changes are counted only when they are actually active for sounding
+   notes, so overwritten setup messages do not create false dynamic programs;
+3. a genuinely multi-program logical channel is locked to one representative
+   program for SFZ-first rendering, using a matching track-name family when
+   available and otherwise sounding note duration/count;
+4. track name is fallback metadata when no usable Program is available;
+5. `Melody` is a dataset role whose rendering policy is configured separately.
 
 A Program/name disagreement is therefore not itself an error. For example, GM
 Program 29 resolves to `electric_guitar_overdrive` and Program 30 resolves to
@@ -56,9 +60,12 @@ exact dedicated SFZ
   -> MuseScore General Full through embedded FluidSynth
 ```
 
-The original single Program Change is preserved for GM fallback when it is
-trustworthy. Otherwise the registry may supply a representative GM program for
-the resolved canonical instrument.
+A representative dynamic program uses the same exact/family SFZ lookup as a
+normal fixed-program stem; source Program Change messages are removed from that
+prepared SFZ MIDI because the timbre is intentionally locked. If no matching
+SFZ is installed, FluidSynth remains the final fallback and preserves a genuine
+dynamic Program Change sequence. Fixed trustworthy source programs are likewise
+preserved for GM fallback.
 
 ## Install
 

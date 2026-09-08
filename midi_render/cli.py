@@ -157,7 +157,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def _print_track(track) -> None:
     instrument = resolve_instrument(track)
-    programs = ",".join(str(x) for x in track.programs) if track.programs else "-"
+    programs = ",".join(str(x) for x in track.effective_programs) if track.effective_programs else "-"
     channels = ",".join(str(x + 1) for x in track.note_channels) if track.note_channels else "-"
     index_label = f"{track.index:02d}" if track.logical_channel is None else f"{track.index:02d}/{track.logical_channel + 1:02d}"
     print(
@@ -432,12 +432,6 @@ def _render_policy(track, resolution, registry: PatchRegistry) -> tuple[str, boo
     - instrument: force one canonical instrument, preferring its dedicated/family
       patch and using that instrument's representative GM Program as fallback.
     """
-    # A single MIDI channel may legitimately change programs over time. SFZ is
-    # a one-timbre-per-stem renderer, so preserve those Program Change events and
-    # send the logical stem directly to General MIDI/FluidSynth.
-    if track.has_dynamic_program:
-        return resolution.instrument, True, None, True
-
     if resolution.instrument != "melody":
         return resolution.instrument, False, None, True
 
@@ -587,7 +581,16 @@ def _build_song_plan(
 
         if patch is not None and route is not None:
             split = make_split_midi(
-                mid, midi_path, track.index, split_dir, performance_plan, channel=track.logical_channel
+                mid,
+                midi_path,
+                track.index,
+                split_dir,
+                performance_plan,
+                channel=track.logical_channel,
+                # A dedicated SFZ fixes one timbre for the whole logical stem.
+                # Strip source Program Change events only for genuinely dynamic
+                # channels so the prepared artifact matches that lock explicitly.
+                strip_program_changes=track.has_dynamic_program,
             )
             render_cache_tag = _sfz_render_cache_tag(
                 split,
@@ -648,8 +651,13 @@ def _build_song_plan(
                 )
                 if gm_program_override is not None:
                     gm_program = gm_program_override
-                elif trust_source_program and resolution.program_trusted and track.primary_program is not None:
-                    gm_program = track.primary_program
+                elif (
+                    trust_source_program
+                    and resolution.program_trusted
+                    and resolution.representative_program is not None
+                    and not track.has_dynamic_program
+                ):
+                    gm_program = resolution.representative_program
                 elif dynamic_source_program:
                     # No single cache/program identity applies; the prepared MIDI
                     # retains the complete Program Change sequence.
@@ -730,7 +738,7 @@ def _build_song_plan(
                 logger.plan_detail(
                     f"{track.stem_label} {track.name!r} -> {mapping} -> "
                     + (
-                        f"GM programs={','.join(str(x) for x in track.programs)} ({program_source}) [gm]"
+                        f"GM programs={','.join(str(x) for x in track.effective_programs)} ({program_source}) [gm]"
                         if gm_program is None
                         else f"GM program={gm_program:03d} ({program_source}) [gm]"
                     )

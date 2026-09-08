@@ -4,7 +4,7 @@ from midi_render.instruments import (
     resolve_instrument,
     resolve_track,
 )
-from midi_render.midi import TrackInfo
+from midi_render.midi import ProgramUsage, TrackInfo
 
 
 def track(name: str, program: int | None = None, channels=(0,)) -> TrackInfo:
@@ -104,3 +104,45 @@ def test_resolution_trusts_any_single_program_regardless_of_name():
     missing = resolve_track(track("Organ"))
     assert missing.instrument == "organ"
     assert missing.program_trusted is False
+
+
+def test_dynamic_program_resolution_uses_name_to_disambiguate_sounding_programs():
+    info = TrackInfo(
+        2,
+        "organ 2",
+        30,
+        (2,),
+        (19, 48, 52),
+        ((2, 52),),
+        program_usage=(
+            ProgramUsage(19, 10, 400, 0),
+            ProgramUsage(48, 10, 900, 400),
+            ProgramUsage(52, 10, 800, 1300),
+        ),
+    )
+    result = resolve_track(info)
+    assert result.instrument == "organ"
+    assert result.representative_program == 19
+    assert result.program_trusted is True
+    assert result.warning is not None
+    assert "locked to program 19" in result.warning
+
+
+def test_dynamic_program_resolution_uses_sounding_duration_without_name_match():
+    info = TrackInfo(
+        3,
+        "Remixed",
+        30,
+        (0,),
+        (16, 17, 18),
+        ((0, 18),),
+        program_usage=(
+            ProgramUsage(16, 10, 200, 0),
+            ProgramUsage(17, 10, 1200, 200),
+            ProgramUsage(18, 10, 600, 1400),
+        ),
+    )
+    result = resolve_track(info)
+    assert result.instrument == "organ"
+    assert result.representative_program == 17
+    assert result.representative_share == 0.6

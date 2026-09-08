@@ -10,6 +10,14 @@ from .patches import PerformanceProfile
 
 
 @dataclass(frozen=True)
+class ProgramUsage:
+    program: int
+    note_count: int
+    duration_ticks: int
+    first_note_tick: int
+
+
+@dataclass(frozen=True)
 class TrackInfo:
     index: int
     name: str
@@ -17,6 +25,10 @@ class TrackInfo:
     note_channels: tuple[int, ...]
     programs: tuple[int, ...]
     program_by_channel: tuple[tuple[int, int], ...]
+    # Programs that were actually active when sounding Note On events occurred.
+    # This deliberately excludes harmless setup/overwritten Program Change
+    # messages before the first note, which are common in real-world MIDI files.
+    program_usage: tuple[ProgramUsage, ...] = ()
     # When a physical MIDI track carries notes for multiple MIDI channels, MRP
     # exposes one logical stem per channel. `index` remains the source/physical
     # track index so legacy --track semantics stay intact; logical_channel makes
@@ -25,20 +37,45 @@ class TrackInfo:
 
     @property
     def primary_program(self) -> int | None:
-        if len(self.programs) == 1:
+        if len(self.note_channels) == 1 and len(self.program_usage) == 1:
+            return self.program_usage[0].program
+        # Keep TrackInfo useful for tests/callers that construct it directly
+        # without the analyzer's richer sounding-program metadata.
+        if not self.program_usage and len(self.programs) == 1:
             return self.programs[0]
-        # A freshly created GM channel defaults to Acoustic Grand Piano. For a
-        # channel split out of a multi-channel physical track, absence of an
-        # explicit Program Change is therefore a trustworthy program-0 signal.
-        if self.logical_channel is not None and not self.programs and self.logical_channel != 9:
-            return 0
         return None
 
     @property
     def has_dynamic_program(self) -> bool:
         # Program Change does not select the GM drum kit on channel 10, so even
         # noisy/redundant program messages there must not disable dedicated drums.
-        return self.note_channels != (9,) and len(self.note_channels) == 1 and len(self.programs) > 1
+        return (
+            self.note_channels != (9,)
+            and len(self.note_channels) == 1
+            and len(self.program_usage) > 1
+        )
+
+    @property
+    def effective_programs(self) -> tuple[int, ...]:
+        if self.program_usage:
+            return tuple(usage.program for usage in self.program_usage)
+        return self.programs
+
+    def usage_for_program(self, program: int) -> ProgramUsage | None:
+        for usage in self.program_usage:
+            if usage.program == program:
+                return usage
+        return None
+
+    def program_share(self, program: int) -> float | None:
+        selected = self.usage_for_program(program)
+        if selected is None:
+            return 1.0 if not self.program_usage and self.primary_program == program else None
+        duration_total = sum(usage.duration_ticks for usage in self.program_usage)
+        if duration_total > 0:
+            return selected.duration_ticks / duration_total
+        note_total = sum(usage.note_count for usage in self.program_usage)
+        return selected.note_count / note_total if note_total > 0 else None
 
     @property
     def stem_channel(self) -> int | None:
@@ -61,10 +98,6 @@ class TrackInfo:
     @property
     def warnings(self) -> tuple[str, ...]:
         warnings: list[str] = []
-        if len(self.programs) > 1:
-            warnings.append(
-                "multiple programs in one track: " + ", ".join(str(x) for x in self.programs)
-            )
         if len(self.note_channels) > 1:
             warnings.append(
                 "notes use multiple MIDI channels: "
@@ -201,10 +234,18 @@ def _copy_with_velocity(msg: mido.Message | mido.MetaMessage, plan: VelocityPlan
 def clone_track_with_velocity_plan(
     track: mido.MidiTrack,
     plan: VelocityPlan | None,
+    *,
+    strip_program_changes: bool = False,
 ) -> mido.MidiTrack:
     out = mido.MidiTrack()
+    pending_time = 0
     for msg in track:
-        out.append(_copy_with_velocity(msg, plan))
+        if strip_program_changes and msg.type == "program_change":
+            pending_time += msg.time
+            continue
+        copied = _copy_with_velocity(msg, plan)
+        out.append(copied.copy(time=msg.time + pending_time))
+        pending_time = 0
     return out
 
 
@@ -215,11 +256,83 @@ def get_track_name(track: mido.MidiTrack) -> str:
     return ""
 
 
+def _program_usage_by_channel(track: mido.MidiTrack) -> dict[int, tuple[ProgramUsage, ...]]:
+    """Measure the GM programs that actually sound on each MIDI channel.
+
+    Program Change is channel state, and many exported/internet MIDI files emit
+    one or more setup programs that are overwritten before any note sounds. A
+    renderer should not treat those as real dynamic timbre changes. We therefore
+    attribute each Note On to the program active at that instant (GM defaults to
+    program 0), then use paired note duration as the primary usage signal.
+    """
+    current_program = {channel: 0 for channel in range(16)}
+    absolute_tick = 0
+    # Repeated note-ons of the same pitch before a note-off are legal enough in
+    # wild MIDI that a small FIFO is safer than storing only one active note.
+    active: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    counts: dict[tuple[int, int], int] = {}
+    durations: dict[tuple[int, int], int] = {}
+    first_ticks: dict[tuple[int, int], int] = {}
+
+    for msg in track:
+        absolute_tick += msg.time
+        if not hasattr(msg, "channel"):
+            continue
+        channel = msg.channel
+        if msg.type == "program_change":
+            current_program[channel] = msg.program
+            continue
+
+        is_note_on = msg.type == "note_on" and msg.velocity > 0
+        is_note_off = msg.type == "note_off" or (
+            msg.type == "note_on" and msg.velocity == 0
+        )
+        if is_note_on:
+            program = current_program[channel]
+            key = (channel, program)
+            counts[key] = counts.get(key, 0) + 1
+            first_ticks.setdefault(key, absolute_tick)
+            active.setdefault((channel, msg.note), []).append((program, absolute_tick))
+        elif is_note_off:
+            stack = active.get((channel, msg.note))
+            if not stack:
+                continue
+            program, start_tick = stack.pop(0)
+            key = (channel, program)
+            durations[key] = durations.get(key, 0) + max(0, absolute_tick - start_tick)
+            if not stack:
+                active.pop((channel, msg.note), None)
+
+    # Malformed files sometimes omit final note-offs. Count the remaining note
+    # duration up to the physical track end rather than throwing the evidence
+    # away entirely.
+    for (channel, _note), stack in active.items():
+        for program, start_tick in stack:
+            key = (channel, program)
+            durations[key] = durations.get(key, 0) + max(0, absolute_tick - start_tick)
+
+    grouped: dict[int, list[ProgramUsage]] = {}
+    for (channel, program), note_count in counts.items():
+        grouped.setdefault(channel, []).append(
+            ProgramUsage(
+                program=program,
+                note_count=note_count,
+                duration_ticks=durations.get((channel, program), 0),
+                first_note_tick=first_ticks[(channel, program)],
+            )
+        )
+    return {
+        channel: tuple(sorted(usages, key=lambda usage: usage.program))
+        for channel, usages in grouped.items()
+    }
+
+
 def analyze_track(index: int, track: mido.MidiTrack) -> TrackInfo:
     note_channels: set[int] = set()
     programs: set[int] = set()
     program_by_channel: dict[int, int] = {}
     note_count = 0
+    usage_by_channel = _program_usage_by_channel(track)
 
     for msg in track:
         if msg.type == "program_change":
@@ -236,6 +349,11 @@ def analyze_track(index: int, track: mido.MidiTrack) -> TrackInfo:
         note_channels=tuple(sorted(note_channels)),
         programs=tuple(sorted(programs)),
         program_by_channel=tuple(sorted(program_by_channel.items())),
+        program_usage=tuple(
+            usage
+            for channel in sorted(usage_by_channel)
+            for usage in usage_by_channel[channel]
+        ),
     )
 
 
@@ -245,10 +363,17 @@ def analyze_midi(path: Path) -> tuple[mido.MidiFile, list[TrackInfo]]:
     return mid, tracks
 
 
-def _analyze_track_channel(index: int, track: mido.MidiTrack, channel: int) -> TrackInfo:
+def _analyze_track_channel(
+    index: int,
+    track: mido.MidiTrack,
+    channel: int,
+    usage_by_channel: dict[int, tuple[ProgramUsage, ...]] | None = None,
+) -> TrackInfo:
     programs: set[int] = set()
     last_program: int | None = None
     note_count = 0
+    if usage_by_channel is None:
+        usage_by_channel = _program_usage_by_channel(track)
     for msg in track:
         if not hasattr(msg, "channel") or msg.channel != channel:
             continue
@@ -266,6 +391,7 @@ def _analyze_track_channel(index: int, track: mido.MidiTrack, channel: int) -> T
         note_channels=(channel,),
         programs=tuple(sorted(programs)),
         program_by_channel=program_by_channel,
+        program_usage=usage_by_channel.get(channel, ()),
         logical_channel=channel,
     )
 
@@ -285,8 +411,14 @@ def logical_tracks(mid: mido.MidiFile, tracks: Iterable[TrackInfo]) -> list[Trac
             out.append(info)
             continue
         source_track = mid.tracks[info.index]
+        usage_by_channel = _program_usage_by_channel(source_track)
         out.extend(
-            _analyze_track_channel(info.index, source_track, channel)
+            _analyze_track_channel(
+                info.index,
+                source_track,
+                channel,
+                usage_by_channel,
+            )
             for channel in info.note_channels
         )
     return out
@@ -360,6 +492,8 @@ def clone_track_for_channel(
     track: mido.MidiTrack,
     channel: int,
     velocity_plan: VelocityPlan | None = None,
+    *,
+    strip_program_changes: bool = False,
 ) -> mido.MidiTrack:
     """Clone one logical MIDI channel while preserving absolute event times.
 
@@ -372,6 +506,8 @@ def clone_track_for_channel(
     pending_time = 0
     for msg in track:
         keep = not hasattr(msg, "channel") or msg.channel == channel
+        if keep and strip_program_changes and msg.type == "program_change":
+            keep = False
         if not keep:
             pending_time += msg.time
             continue
@@ -388,6 +524,7 @@ def make_split_midi(
     split_dir: Path,
     velocity_plan: VelocityPlan | None = None,
     channel: int | None = None,
+    strip_program_changes: bool = False,
 ) -> Path:
     """Keep conductor/meta track 0 plus exactly one logical musical stem."""
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -396,9 +533,18 @@ def make_split_midi(
     if len(source.tracks) > 0 and track_index != 0:
         out.tracks.append(clone_conductor_track(source.tracks[0]))
     if channel is None:
-        musical = clone_track_with_velocity_plan(source.tracks[track_index], velocity_plan)
+        musical = clone_track_with_velocity_plan(
+            source.tracks[track_index],
+            velocity_plan,
+            strip_program_changes=strip_program_changes,
+        )
     else:
-        musical = clone_track_for_channel(source.tracks[track_index], channel, velocity_plan)
+        musical = clone_track_for_channel(
+            source.tracks[track_index],
+            channel,
+            velocity_plan,
+            strip_program_changes=strip_program_changes,
+        )
     out.tracks.append(musical)
 
     safe = source_path.stem.replace("/", "_")

@@ -5,7 +5,7 @@ import mido
 from midi_render.midi import analyze_midi, make_note_filtered_midi, make_program_override_midi, midi_timeline_metrics
 
 
-def test_analyzer_reports_multi_program(tmp_path: Path):
+def test_analyzer_ignores_program_change_that_never_sounds(tmp_path: Path):
     mid = mido.MidiFile(type=1)
     conductor = mido.MidiTrack()
     conductor.append(mido.MetaMessage("track_name", name="Conductor", time=0))
@@ -23,7 +23,41 @@ def test_analyzer_reports_multi_program(tmp_path: Path):
     mid.save(path)
     _, tracks = analyze_midi(path)
     assert tracks[1].programs == (27, 30)
-    assert any("multiple programs" in x for x in tracks[1].warnings)
+    assert tracks[1].effective_programs == (27,)
+    assert tracks[1].primary_program == 27
+    assert tracks[1].has_dynamic_program is False
+    assert tracks[1].warnings == ()
+
+
+def test_analyzer_tracks_only_programs_that_really_sound_and_measures_usage(tmp_path: Path):
+    mid = mido.MidiFile(type=1, ticks_per_beat=480)
+    conductor = mido.MidiTrack()
+    mid.tracks.append(conductor)
+
+    track = mido.MidiTrack()
+    # Harmless setup program: overwritten before the first note.
+    track.append(mido.Message("program_change", channel=0, program=4, time=0))
+    track.append(mido.Message("program_change", channel=0, program=34, time=0))
+    track.append(mido.Message("note_on", channel=0, note=40, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=40, velocity=0, time=480))
+    track.append(mido.Message("program_change", channel=0, program=33, time=0))
+    track.append(mido.Message("note_on", channel=0, note=43, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=43, velocity=0, time=120))
+    mid.tracks.append(track)
+
+    path = tmp_path / "usage.mid"
+    mid.save(path)
+    _, tracks = analyze_midi(path)
+    info = tracks[1]
+
+    assert info.programs == (4, 33, 34)
+    assert info.effective_programs == (33, 34)
+    assert info.has_dynamic_program is True
+    usage = {item.program: item for item in info.program_usage}
+    assert usage[34].note_count == 1
+    assert usage[34].duration_ticks == 480
+    assert usage[33].note_count == 1
+    assert usage[33].duration_ticks == 120
 
 
 def test_make_note_filtered_midi_keeps_only_selected_notes_and_preserves_time(tmp_path: Path):

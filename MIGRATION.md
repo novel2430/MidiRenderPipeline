@@ -254,9 +254,15 @@ Patch-local effects still run first, so existing chains such as
 
 ## 9. Resolver and patch-policy migration
 
-Current resolution is Program-first. A single usable GM Program Change is the
-primary timbre identity; track name is fallback metadata. Program/name conflict
-is not itself an error.
+Current resolution is Program-first, but real-world MIDI is normalized before
+routing. Multi-channel physical tracks are expanded to per-channel logical
+stems. Program Changes that are overwritten before any note sounds are ignored
+for timbre identity. If one logical channel genuinely sounds with multiple
+programs, MRP chooses a representative program (matching a trustworthy track
+name family when possible, otherwise by sounding note duration/count) and keeps
+the normal SFZ-first coverage order. Only when that representative instrument
+has no dedicated/family SFZ does FluidSynth remain the final fallback, where the
+original dynamic Program Change sequence is preserved.
 
 Coverage order:
 

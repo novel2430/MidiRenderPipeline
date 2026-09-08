@@ -96,8 +96,10 @@ physical task creates the FluidSynth synth/session it needs:
 
 - singleton/simple GM stem -> native file renderer;
 - 2..16 ordinary one-channel GM stems -> one multi-output synth/session;
-- source track with multiple MIDI channels -> native single-stem compatibility
-  render.
+- a physical multi-channel MIDI track is split into logical one-channel stems
+  during planning, so it can use the same normal SFZ/GM execution paths;
+- a genuinely dynamic-program logical stem that has no representative SFZ may
+  keep its source Program Change sequence in the GM path.
 
 FluidSynth internal `synth.cpu-cores` remains 1.
 
