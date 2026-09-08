@@ -28,6 +28,7 @@ from .midi import (
     make_split_midi,
     midi_timeline_metrics,
     musical_tracks,
+    logical_tracks,
 )
 from .patches import Patch, PatchRegistry
 from .render_log import LogOptions, RenderLogger
@@ -158,8 +159,9 @@ def _print_track(track) -> None:
     instrument = resolve_instrument(track)
     programs = ",".join(str(x) for x in track.programs) if track.programs else "-"
     channels = ",".join(str(x + 1) for x in track.note_channels) if track.note_channels else "-"
+    index_label = f"{track.index:02d}" if track.logical_channel is None else f"{track.index:02d}/{track.logical_channel + 1:02d}"
     print(
-        f"[{track.index:02d}] {track.name or '<unnamed>':24.24s} "
+        f"[{index_label:5s}] {track.name or '<unnamed>':24.24s} "
         f"notes={track.note_count:5d} ch={channels:8s} prog={programs:10s} "
         f"=> {instrument}"
     )
@@ -168,7 +170,8 @@ def _print_track(track) -> None:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    _, tracks = analyze_midi(args.midi)
+    mid, physical_tracks = analyze_midi(args.midi)
+    tracks = logical_tracks(mid, physical_tracks)
     print(f"MIDI: {args.midi.resolve()}\n")
     for track in tracks:
         if args.all_tracks or track.has_notes:
@@ -193,7 +196,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     track_count = 0
 
     for path in files:
-        _, tracks = analyze_midi(path)
+        mid, physical_tracks = analyze_midi(path)
+        tracks = logical_tracks(mid, physical_tracks)
         for track in musical_tracks(tracks):
             instrument = resolve_instrument(track)
             if instrument == "melody" and not args.include_melody:
@@ -383,9 +387,11 @@ def _raw_stem_path(
     render_cache_tag: str,
     gm_program: int | None = None,
     performance_plan: VelocityPlan | None = None,
+    channel: int | None = None,
 ) -> Path:
+    channel_suffix = "" if channel is None else f".ch-{channel + 1:02d}"
     base = (
-        f"track-{track_index:02d}.{instrument}"
+        f"track-{track_index:02d}{channel_suffix}.{instrument}"
         f"{_performance_cache_suffix(performance_plan)}.render-{render_cache_tag}"
     )
     if route == "exact":
@@ -394,16 +400,17 @@ def _raw_stem_path(
         return stems_dir / f"{base}.family-{_safe_cache_component(patch.name)}.raw.wav"
     if route == "gm":
         if gm_program is None:
-            raise ValueError("GM cache path requires gm_program")
+            return stems_dir / f"{base}.gm-dynamic.raw.wav"
         return stems_dir / f"{base}.gm-p{gm_program:03d}.raw.wav"
     raise ValueError(f"unknown render route: {route}")
 
 
-def _gm_patch(registry: PatchRegistry, program: int) -> Patch:
+def _gm_patch(registry: PatchRegistry, program: int | None) -> Patch:
     gm = registry.general_midi_fallback
     assert gm is not None
+    name = "gm_fallback_dynamic" if program is None else f"gm_fallback_p{program:03d}"
     return Patch(
-        name=f"gm_fallback_p{program:03d}",
+        name=name,
         library="<general_midi_fallback>",
         sfz=gm.soundfont,
         gain_db=gm.gain_db,
@@ -425,6 +432,12 @@ def _render_policy(track, resolution, registry: PatchRegistry) -> tuple[str, boo
     - instrument: force one canonical instrument, preferring its dedicated/family
       patch and using that instrument's representative GM Program as fallback.
     """
+    # A single MIDI channel may legitimately change programs over time. SFZ is
+    # a one-timbre-per-stem renderer, so preserve those Program Change events and
+    # send the logical stem directly to General MIDI/FluidSynth.
+    if track.has_dynamic_program:
+        return resolution.instrument, True, None, True
+
     if resolution.instrument != "melody":
         return resolution.instrument, False, None, True
 
@@ -522,7 +535,8 @@ def _build_song_plan(
     midi_path = midi_path.resolve()
     output = output.resolve()
     work_dir = work_dir.resolve()
-    mid, tracks = analyze_midi(midi_path)
+    mid, physical_tracks = analyze_midi(midi_path)
+    tracks = logical_tracks(mid, physical_tracks)
     selected_tracks = _select_render_tracks(tracks, track_index)
     split_dir = work_dir / "midi"
     stems_dir = work_dir / "stems"
@@ -546,12 +560,12 @@ def _build_song_plan(
         instrument = resolution.instrument
         if instrument == "melody" and not settings.include_melody:
             if logger is not None and logger.verbose:
-                logger.plan_detail(f"SKIP track={track.index:02d} {track.name!r} -> melody")
+                logger.plan_detail(f"SKIP {track.stem_label} {track.name!r} -> melody")
             continue
 
         if logger is not None:
             for warning in (*track.warnings, *resolution_warnings(track)):
-                logger.warning(f"track {track.index:02d} {track.name!r}: {warning}", song=midi_path)
+                logger.warning(f"{track.stem_label} {track.name!r}: {warning}", song=midi_path)
 
         render_instrument, force_gm, gm_program_override, trust_source_program = _render_policy(
             track, resolution, registry
@@ -559,6 +573,7 @@ def _build_song_plan(
         performance_plan = build_velocity_plan(
             mid.tracks[track.index],
             registry.performance_profile(render_instrument),
+            channel=track.logical_channel,
         )
         if logger is not None and logger.verbose:
             perf_text = _performance_plan_text(render_instrument, performance_plan)
@@ -571,7 +586,9 @@ def _build_song_plan(
         gm_program: int | None = None
 
         if patch is not None and route is not None:
-            split = make_split_midi(mid, midi_path, track.index, split_dir, performance_plan)
+            split = make_split_midi(
+                mid, midi_path, track.index, split_dir, performance_plan, channel=track.logical_channel
+            )
             render_cache_tag = _sfz_render_cache_tag(
                 split,
                 patch,
@@ -591,22 +608,24 @@ def _build_song_plan(
                 patch,
                 render_cache_tag,
                 performance_plan=performance_plan,
+                channel=track.logical_channel,
             )
             if logger is not None and logger.verbose:
                 route_label = route if route == "family" else "exact"
                 mapping = instrument if instrument == render_instrument else f"{instrument} -> {render_instrument}"
                 logger.plan_detail(
-                    f"track={track.index:02d} {track.name!r} -> {mapping} -> {patch.name} [{route_label}]"
+                    f"{track.stem_label} {track.name!r} -> {mapping} -> {patch.name} [{route_label}]"
                 )
 
             stem_plans.append(
                 StemPlan(
-                    stem_id=make_stem_id(track.index, render_instrument),
+                    stem_id=make_stem_id(track.index, render_instrument, track.logical_channel),
                     track_index=track.index,
                     instrument=render_instrument,
                     raw_backend=Backend.SFZ,
                     raw_output=stem,
                     effects=registry.stem_effects(render_instrument, patch),
+                    source_channel=track.logical_channel,
                 )
             )
             if reuse_raw and stem.is_file():
@@ -622,10 +641,19 @@ def _build_song_plan(
             elif not gm.soundfont.is_file():
                 reason = f"GM fallback SoundFont missing: {gm.soundfont}"
             else:
+                dynamic_source_program = (
+                    trust_source_program
+                    and track.has_dynamic_program
+                    and len(track.note_channels) == 1
+                )
                 if gm_program_override is not None:
                     gm_program = gm_program_override
                 elif trust_source_program and resolution.program_trusted and track.primary_program is not None:
                     gm_program = track.primary_program
+                elif dynamic_source_program:
+                    # No single cache/program identity applies; the prepared MIDI
+                    # retains the complete Program Change sequence.
+                    gm_program = None
                 else:
                     gm_program = gm.representative_program(gm_lookup_instrument)
                     if gm_program is None and instrument == "melody":
@@ -641,23 +669,25 @@ def _build_song_plan(
                 if settings.skip_unconfigured:
                     if logger is not None and logger.verbose:
                         logger.plan_detail(
-                            f"SKIP track={track.index:02d} {track.name!r} -> {instrument} ({reason})"
+                            f"SKIP {track.stem_label} {track.name!r} -> {instrument} ({reason})"
                         )
                     skipped.append((track.index, instrument, reason))
                     continue
                 raise RuntimeError(
-                    f"track {track.index} {track.name!r} resolved to {instrument}, but {reason}"
+                    f"{track.stem_label} {track.name!r} resolved to {instrument}, but {reason}"
                 )
 
-            assert gm is not None and gm_program is not None
+            assert gm is not None
             patch = _gm_patch(registry, gm_program)
             preserve_source_program = (
                 gm_program_override is None
                 and trust_source_program
-                and resolution.program_trusted
+                and (resolution.program_trusted or track.has_dynamic_program)
             )
             if preserve_source_program:
-                split = make_split_midi(mid, midi_path, track.index, split_dir, performance_plan)
+                split = make_split_midi(
+                mid, midi_path, track.index, split_dir, performance_plan, channel=track.logical_channel
+            )
             else:
                 split = make_program_override_midi(
                     mid,
@@ -666,6 +696,7 @@ def _build_song_plan(
                     split_dir,
                     gm_program,
                     velocity_plan=performance_plan,
+                    channel=track.logical_channel,
                 )
             render_mode = "single-native" if track_index is not None else "full-render"
             render_cache_tag = _gm_render_cache_tag(
@@ -684,28 +715,40 @@ def _build_song_plan(
                 render_cache_tag,
                 gm_program,
                 performance_plan,
+                channel=track.logical_channel,
             )
             if logger is not None and logger.verbose:
                 if gm_program_override is not None:
                     program_source = "melody-config"
+                elif track.has_dynamic_program and preserve_source_program:
+                    program_source = "source-dynamic"
                 elif trust_source_program and resolution.program_trusted:
                     program_source = "source"
                 else:
                     program_source = "representative"
                 mapping = instrument if instrument == render_instrument else f"{instrument} -> {render_instrument}"
                 logger.plan_detail(
-                    f"track={track.index:02d} {track.name!r} -> {mapping} -> "
-                    f"GM program={gm_program:03d} ({program_source}) [gm]"
+                    f"{track.stem_label} {track.name!r} -> {mapping} -> "
+                    + (
+                        f"GM programs={','.join(str(x) for x in track.programs)} ({program_source}) [gm]"
+                        if gm_program is None
+                        else f"GM program={gm_program:03d} ({program_source}) [gm]"
+                    )
                 )
 
             stem_plans.append(
                 StemPlan(
-                    stem_id=make_stem_id(track.index, render_instrument),
+                    stem_id=make_stem_id(track.index, render_instrument, track.logical_channel),
                     track_index=track.index,
                     instrument=render_instrument,
                     raw_backend=Backend.FLUIDSYNTH,
                     raw_output=stem,
-                    effects=registry.stem_effects(render_instrument, patch),
+                    effects=(
+                        ()
+                        if track.has_dynamic_program
+                        else registry.stem_effects(render_instrument, patch)
+                    ),
+                    source_channel=track.logical_channel,
                 )
             )
             if reuse_raw and stem.is_file():
@@ -736,6 +779,7 @@ def _build_song_plan(
                     layer.notes,
                     "kick-layer",
                     performance_plan,
+                    channel=track.logical_channel,
                 )
                 kick_cache_tag = _sfz_render_cache_tag(
                     kick_midi,
@@ -760,12 +804,13 @@ def _build_song_plan(
                     )
                 stem_plans.append(
                     StemPlan(
-                        stem_id=make_stem_id(track.index, "drums_kick_layer"),
+                        stem_id=make_stem_id(track.index, "drums_kick_layer", track.logical_channel),
                         track_index=track.index,
                         instrument="drums_kick_layer",
                         raw_backend=Backend.SFZ,
                         raw_output=kick_stem,
                         effects=registry.stem_effects("drums_kick_layer", kick_patch),
+                        source_channel=track.logical_channel,
                     )
                 )
                 if reuse_raw and kick_stem.is_file():
@@ -779,16 +824,18 @@ def _build_song_plan(
     song_id = make_song_id(midi_path, output, run_identity)
     raw_tasks = []
     for job in sfz_jobs:
-        stem_id = make_stem_id(job.track.index, job.instrument)
+        stem_id = make_stem_id(job.track.index, job.instrument, job.track.logical_channel)
         raw_tasks.append(make_task(song_id, Stage.RAW, Backend.SFZ, (stem_id,), job))
     if gm_jobs:
-        stem_ids = tuple(make_stem_id(job.track.index, job.instrument) for job in gm_jobs)
+        stem_ids = tuple(make_stem_id(job.track.index, job.instrument, job.track.logical_channel) for job in gm_jobs)
         raw_tasks.append(
             make_task(song_id, Stage.RAW, Backend.FLUIDSYNTH, stem_ids, tuple(gm_jobs))
         )
 
     music_duration_seconds, music_bars = midi_timeline_metrics(mid)
-    rendered_track_count = len({stem.track_index for stem in stem_plans})
+    rendered_track_count = len(
+        {(stem.track_index, stem.source_channel) for stem in stem_plans if stem.instrument != "drums_kick_layer"}
+    )
 
     return SongPlan(
         song_id=song_id,

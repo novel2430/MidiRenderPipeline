@@ -764,3 +764,93 @@ def test_legacy_worker_cli_aliases_map_to_concurrency_fields():
     assert args.gm_concurrency == 2
     assert args.fx_concurrency == 5
     assert args.mix_concurrency == 3
+
+
+def _make_multichannel_type0_midi(path: Path) -> None:
+    mid = mido.MidiFile(type=0, ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="Whole Song Title", time=0))
+    track.append(mido.MetaMessage("set_tempo", tempo=500_000, time=0))
+    track.append(mido.Message("program_change", channel=0, program=33, time=0))
+    track.append(mido.Message("note_on", channel=0, note=40, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=40, velocity=0, time=120))
+    track.append(mido.Message("program_change", channel=1, program=0, time=0))
+    track.append(mido.Message("note_on", channel=1, note=60, velocity=85, time=0))
+    track.append(mido.Message("note_off", channel=1, note=60, velocity=0, time=120))
+    mid.tracks.append(track)
+    mid.save(path)
+
+
+def test_song_plan_expands_multichannel_track_into_unique_gm_stems(tmp_path: Path):
+    midi = tmp_path / "type0.mid"
+    _make_multichannel_type0_midi(midi)
+    config = _make_gm_fallback_config(tmp_path)
+    args = _args(midi, config, tmp_path / "work-type0")
+    settings = cli._render_settings_from_args(args, active_songs=1)
+
+    plan = cli._build_song_plan(
+        midi,
+        registry=cli.PatchRegistry(config),
+        output=tmp_path / "type0.wav",
+        work_dir=tmp_path / "work-type0",
+        settings=settings,
+        track_index=None,
+        reuse_raw=False,
+        verbose=False,
+    )
+
+    assert len(plan.stems) == 2
+    assert len({stem.stem_id for stem in plan.stems}) == 2
+    assert {stem.source_channel for stem in plan.stems} == {0, 1}
+    assert {stem.instrument for stem in plan.stems} == {"electric_bass", "acoustic_piano"}
+    gm_jobs = [job for task in plan.raw_tasks if task.backend == cli.Backend.FLUIDSYNTH for job in task.payload]
+    assert len(gm_jobs) == 2
+    assert {job.patch.name for job in gm_jobs} == {"gm_fallback_p033", "gm_fallback_p000"}
+    for job in gm_jobs:
+        split = mido.MidiFile(job.split_midi).tracks[-1]
+        channels = {msg.channel for msg in split if hasattr(msg, "channel")}
+        assert channels == {job.track.logical_channel}
+
+
+def test_dynamic_program_on_one_channel_preserves_source_changes_and_forces_gm(tmp_path: Path):
+    midi = tmp_path / "dynamic.mid"
+    mid = mido.MidiFile(type=1, ticks_per_beat=480)
+    conductor = mido.MidiTrack()
+    conductor.append(mido.MetaMessage("track_name", name="Conductor", time=0))
+    mid.tracks.append(conductor)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="organ 1", time=0))
+    track.append(mido.Message("program_change", channel=2, program=16, time=0))
+    track.append(mido.Message("note_on", channel=2, note=60, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=2, note=60, velocity=0, time=120))
+    track.append(mido.Message("program_change", channel=2, program=50, time=0))
+    track.append(mido.Message("note_on", channel=2, note=64, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=2, note=64, velocity=0, time=120))
+    mid.tracks.append(track)
+    mid.save(midi)
+
+    config = _make_gm_fallback_config(tmp_path)
+    args = _args(midi, config, tmp_path / "work-dynamic")
+    settings = cli._render_settings_from_args(args, active_songs=1)
+    plan = cli._build_song_plan(
+        midi,
+        registry=cli.PatchRegistry(config),
+        output=tmp_path / "dynamic.wav",
+        work_dir=tmp_path / "work-dynamic",
+        settings=settings,
+        track_index=None,
+        reuse_raw=False,
+        verbose=False,
+    )
+
+    assert len(plan.stems) == 1
+    stem = plan.stems[0]
+    assert stem.instrument == "organ"
+    assert stem.raw_backend == cli.Backend.FLUIDSYNTH
+    assert stem.effects == ()
+    task = next(task for task in plan.raw_tasks if task.backend == cli.Backend.FLUIDSYNTH)
+    assert len(task.payload) == 1
+    job = task.payload[0]
+    assert job.patch.name == "gm_fallback_dynamic"
+    split = mido.MidiFile(job.split_midi).tracks[-1]
+    assert [msg.program for msg in split if msg.type == "program_change"] == [16, 50]

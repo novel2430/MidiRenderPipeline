@@ -273,3 +273,89 @@ def test_midi_timeline_metrics_follow_tempo_and_time_signature():
 
     assert seconds == 5.0
     assert bars == 2.0
+
+
+def test_logical_tracks_split_multichannel_physical_track_and_keep_implicit_program_zero(tmp_path: Path):
+    from midi_render.midi import logical_tracks
+
+    mid = mido.MidiFile(type=0, ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="Whole Song", time=0))
+    track.append(mido.MetaMessage("set_tempo", tempo=500_000, time=0))
+    track.append(mido.Message("program_change", channel=0, program=33, time=0))
+    track.append(mido.Message("note_on", channel=0, note=40, velocity=90, time=0))
+    track.append(mido.Message("note_off", channel=0, note=40, velocity=0, time=120))
+    # Channel 2 intentionally has no Program Change: GM default is program 0.
+    track.append(mido.Message("note_on", channel=1, note=60, velocity=80, time=0))
+    track.append(mido.Message("note_off", channel=1, note=60, velocity=0, time=120))
+    mid.tracks.append(track)
+    path = tmp_path / "type0.mid"
+    mid.save(path)
+
+    loaded, physical = analyze_midi(path)
+    logical = logical_tracks(loaded, physical)
+
+    assert len(logical) == 2
+    assert [(item.index, item.logical_channel) for item in logical] == [(0, 0), (0, 1)]
+    assert logical[0].programs == (33,)
+    assert logical[0].primary_program == 33
+    assert logical[1].programs == ()
+    assert logical[1].primary_program == 0
+    assert all(len(item.note_channels) == 1 for item in logical)
+
+
+def test_make_split_midi_filters_one_logical_channel_without_shifting_timeline(tmp_path: Path):
+    from midi_render.midi import make_split_midi
+
+    mid = mido.MidiFile(type=0, ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="Whole Song", time=0))
+    track.append(mido.Message("program_change", channel=0, program=33, time=0))
+    track.append(mido.Message("program_change", channel=1, program=0, time=0))
+    track.append(mido.Message("note_on", channel=0, note=40, velocity=90, time=10))
+    track.append(mido.Message("note_on", channel=1, note=60, velocity=80, time=20))
+    track.append(mido.Message("note_off", channel=0, note=40, velocity=0, time=30))
+    track.append(mido.Message("note_off", channel=1, note=60, velocity=0, time=40))
+    mid.tracks.append(track)
+    source = tmp_path / "type0.mid"
+    mid.save(source)
+
+    loaded = mido.MidiFile(source)
+    out = make_split_midi(loaded, source, 0, tmp_path / "split", channel=1)
+    isolated = mido.MidiFile(out).tracks[-1]
+
+    assert {msg.channel for msg in isolated if hasattr(msg, "channel")} == {1}
+    assert {msg.program for msg in isolated if msg.type == "program_change"} == {0}
+    absolute = 0
+    note_times = []
+    for msg in isolated:
+        absolute += msg.time
+        if msg.type in {"note_on", "note_off"}:
+            note_times.append(absolute)
+    # Original channel-2 note times are 30 and 100 ticks in absolute time.
+    assert note_times == [30, 100]
+
+
+def test_split_from_nonzero_track_does_not_leak_track0_music_into_conductor(tmp_path: Path):
+    from midi_render.midi import make_split_midi
+
+    mid = mido.MidiFile(type=1, ticks_per_beat=480)
+    track0 = mido.MidiTrack()
+    track0.append(mido.MetaMessage("set_tempo", tempo=500_000, time=0))
+    track0.append(mido.Message("note_on", channel=4, note=72, velocity=90, time=10))
+    track0.append(mido.Message("note_off", channel=4, note=72, velocity=0, time=20))
+    mid.tracks.append(track0)
+    track1 = mido.MidiTrack()
+    track1.append(mido.Message("program_change", channel=0, program=33, time=0))
+    track1.append(mido.Message("note_on", channel=0, note=40, velocity=90, time=0))
+    track1.append(mido.Message("note_off", channel=0, note=40, velocity=0, time=120))
+    mid.tracks.append(track1)
+    source = tmp_path / "mixed-track0.mid"
+    mid.save(source)
+
+    loaded = mido.MidiFile(source)
+    out = make_split_midi(loaded, source, 1, tmp_path / "split")
+    result = mido.MidiFile(out)
+    assert len(result.tracks) == 2
+    assert not any(msg.type in {"note_on", "note_off"} for msg in result.tracks[0])
+    assert any(msg.type == "set_tempo" for msg in result.tracks[0])

@@ -186,6 +186,8 @@ def _name_family(name: str) -> str | None:
         return "harmonica"
     if "piano" in name:
         return "acoustic_piano"
+    if "organ" in name:
+        return "organ"
     if "guitar" in name:
         return "electric_guitar_clean"
     if "bass" in name:
@@ -224,7 +226,16 @@ def resolve_track(track: TrackInfo) -> InstrumentResolution:
     # No single usable Program: fall back to textual metadata. This also covers
     # multi-program tracks, which the analyzer already reports as unusual.
     name_family = _name_family(name)
-    return InstrumentResolution(name_family or "unknown", False)
+    if name_family is not None:
+        return InstrumentResolution(name_family, False)
+
+    # For a single pitched MIDI channel with no Program Change at all, General
+    # MIDI starts on program 0. Keep named legacy/Jay tracks on the name fallback
+    # above, but let otherwise-unresolvable real-world files render correctly.
+    if len(track.note_channels) == 1 and not track.programs and track.note_channels != (9,):
+        return InstrumentResolution("acoustic_piano", True)
+
+    return InstrumentResolution("unknown", False)
 
 def resolution_warnings(track: TrackInfo) -> tuple[str, ...]:
     result = resolve_track(track)

@@ -76,7 +76,15 @@ def _safe_stem_component(value: str) -> str:
 
 
 def _stem_fx_prefix(stem: RenderedStem) -> str:
-    return f"track-{stem.track.index:02d}.{_safe_stem_component(stem.instrument)}"
+    channel_suffix = (
+        ""
+        if stem.track.logical_channel is None
+        else f".ch-{stem.track.logical_channel + 1:02d}"
+    )
+    return (
+        f"track-{stem.track.index:02d}{channel_suffix}."
+        f"{_safe_stem_component(stem.instrument)}"
+    )
 
 
 def _effect_paths(

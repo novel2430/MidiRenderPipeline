@@ -152,6 +152,7 @@ class StemPlan:
     raw_backend: Backend
     raw_output: Path
     effects: tuple[str, ...]
+    source_channel: int | None = None
 
 
 @dataclass(frozen=True)
@@ -206,8 +207,9 @@ def make_song_id(midi_path: Path, output: Path, run_identity: str = "") -> str:
     return sha1(payload.encode("utf-8")).hexdigest()[:20]
 
 
-def make_stem_id(track_index: int, instrument: str) -> str:
-    return f"track-{track_index:02d}:{instrument}"
+def make_stem_id(track_index: int, instrument: str, channel: int | None = None) -> str:
+    channel_suffix = "" if channel is None else f"/ch-{channel + 1:02d}"
+    return f"track-{track_index:02d}{channel_suffix}:{instrument}"
 
 
 def _task_id(song_id: str, stage: Stage, backend: Backend, stem_ids: tuple[str, ...]) -> str:
@@ -467,7 +469,15 @@ def _execute_fx(payload: _FXPayload) -> _TaskExecution:
         diagnostics=diagnostics,
     )
     value = MixStem(
-        name=f"track-{payload.stem.track.index:02d} {payload.stem.instrument}",
+        name=(
+            f"track-{payload.stem.track.index:02d}"
+            + (
+                ""
+                if payload.stem.track.logical_channel is None
+                else f"/ch-{payload.stem.track.logical_channel + 1:02d}"
+            )
+            + f" {payload.stem.instrument}"
+        ),
         path=final,
         gain_db=payload.stem.patch.gain_db,
     )
@@ -628,7 +638,7 @@ class RenderingCoordinator:
         self._maybe_queue_mix(runtime)
 
     def _raw_ready(self, runtime: _Runtime, stem: RenderedStem) -> None:
-        stem_id = make_stem_id(stem.track.index, stem.instrument)
+        stem_id = make_stem_id(stem.track.index, stem.instrument, stem.track.logical_channel)
         stem_plan = runtime.stem_plans.get(stem_id)
         if stem_plan is None:
             raise RuntimeError(
@@ -650,7 +660,11 @@ class RenderingCoordinator:
             self.pending_fx.append(task)
         else:
             runtime.processed[stem_id] = MixStem(
-                name=f"track-{stem.track.index:02d} {stem.instrument}",
+                name=(
+                    f"track-{stem.track.index:02d}"
+                    + ("" if stem.track.logical_channel is None else f"/ch-{stem.track.logical_channel + 1:02d}")
+                    + f" {stem.instrument}"
+                ),
                 path=stem.path,
                 gain_db=stem.patch.gain_db,
             )
@@ -877,18 +891,18 @@ class RenderingCoordinator:
     def _task_label(self, task: RenderTask) -> str:
         payload = task.payload
         if task.backend == Backend.SFZ and isinstance(payload, RenderJob):
-            return f"{payload.track.index:02d} {payload.instrument} · sfz"
+            return f"{payload.track.stem_label.removeprefix('track ')} {payload.instrument} · sfz"
         if task.backend == Backend.FLUIDSYNTH:
             jobs = payload.jobs if isinstance(payload, _GMPayload) else payload
             if isinstance(jobs, tuple):
                 if len(jobs) == 1:
                     job = jobs[0]
-                    return f"{job.track.index:02d} {job.instrument} · fluidsynth"
-                tracks = ",".join(f"{job.track.index:02d}" for job in jobs)
+                    return f"{job.track.stem_label.removeprefix('track ')} {job.instrument} · fluidsynth"
+                tracks = ",".join(job.track.stem_label.removeprefix("track ") for job in jobs)
                 return f"tracks {tracks} · fluidsynth batch"
         if task.backend == Backend.FX and isinstance(payload, _FXPayload):
             chain = " → ".join(payload.effects)
-            return f"{payload.stem.track.index:02d} {payload.stem.instrument} · {chain}"
+            return f"{payload.stem.track.stem_label.removeprefix('track ')} {payload.stem.instrument} · {chain}"
         if task.backend == Backend.MIXER and isinstance(payload, _MixPayload):
             return f"{len(payload.stems)} stem{'s' if len(payload.stems) != 1 else ''}"
         return ",".join(task.stem_ids)

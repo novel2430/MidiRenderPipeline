@@ -17,10 +17,38 @@ class TrackInfo:
     note_channels: tuple[int, ...]
     programs: tuple[int, ...]
     program_by_channel: tuple[tuple[int, int], ...]
+    # When a physical MIDI track carries notes for multiple MIDI channels, MRP
+    # exposes one logical stem per channel. `index` remains the source/physical
+    # track index so legacy --track semantics stay intact; logical_channel makes
+    # the stem identity unique without changing well-formed Type-1/Jay inputs.
+    logical_channel: int | None = None
 
     @property
     def primary_program(self) -> int | None:
-        return self.programs[0] if len(self.programs) == 1 else None
+        if len(self.programs) == 1:
+            return self.programs[0]
+        # A freshly created GM channel defaults to Acoustic Grand Piano. For a
+        # channel split out of a multi-channel physical track, absence of an
+        # explicit Program Change is therefore a trustworthy program-0 signal.
+        if self.logical_channel is not None and not self.programs and self.logical_channel != 9:
+            return 0
+        return None
+
+    @property
+    def has_dynamic_program(self) -> bool:
+        # Program Change does not select the GM drum kit on channel 10, so even
+        # noisy/redundant program messages there must not disable dedicated drums.
+        return self.note_channels != (9,) and len(self.note_channels) == 1 and len(self.programs) > 1
+
+    @property
+    def stem_channel(self) -> int | None:
+        return self.logical_channel
+
+    @property
+    def stem_label(self) -> str:
+        if self.logical_channel is None:
+            return f"track {self.index:02d}"
+        return f"track {self.index:02d}/ch {self.logical_channel + 1:02d}"
 
     @property
     def has_notes(self) -> bool:
@@ -95,6 +123,7 @@ def _percentile(values: list[int], quantile: float) -> float:
 def build_velocity_plan(
     track: mido.MidiTrack,
     profile: PerformanceProfile | None,
+    channel: int | None = None,
 ) -> VelocityPlan | None:
     if profile is None:
         return None
@@ -102,7 +131,9 @@ def build_velocity_plan(
     velocities = [
         msg.velocity
         for msg in track
-        if msg.type == "note_on" and msg.velocity > 0
+        if msg.type == "note_on"
+        and msg.velocity > 0
+        and (channel is None or msg.channel == channel)
     ]
     if not velocities:
         return None
@@ -214,6 +245,53 @@ def analyze_midi(path: Path) -> tuple[mido.MidiFile, list[TrackInfo]]:
     return mid, tracks
 
 
+def _analyze_track_channel(index: int, track: mido.MidiTrack, channel: int) -> TrackInfo:
+    programs: set[int] = set()
+    last_program: int | None = None
+    note_count = 0
+    for msg in track:
+        if not hasattr(msg, "channel") or msg.channel != channel:
+            continue
+        if msg.type == "program_change":
+            programs.add(msg.program)
+            last_program = msg.program
+        elif msg.type == "note_on" and msg.velocity > 0:
+            note_count += 1
+
+    program_by_channel = () if last_program is None else ((channel, last_program),)
+    return TrackInfo(
+        index=index,
+        name=get_track_name(track),
+        note_count=note_count,
+        note_channels=(channel,),
+        programs=tuple(sorted(programs)),
+        program_by_channel=program_by_channel,
+        logical_channel=channel,
+    )
+
+
+def logical_tracks(mid: mido.MidiFile, tracks: Iterable[TrackInfo]) -> list[TrackInfo]:
+    """Expand multi-channel physical tracks into renderable logical stems.
+
+    Conventional Type-1 files with one instrument/channel per physical track
+    are returned unchanged, preserving the exact legacy/Jay behavior. A track
+    that actually carries note events on multiple MIDI channels is exposed as
+    one TrackInfo per note-bearing channel, while retaining the source track
+    index for diagnostics and --track selection.
+    """
+    out: list[TrackInfo] = []
+    for info in tracks:
+        if len(info.note_channels) <= 1:
+            out.append(info)
+            continue
+        source_track = mid.tracks[info.index]
+        out.extend(
+            _analyze_track_channel(info.index, source_track, channel)
+            for channel in info.note_channels
+        )
+    return out
+
+
 def midi_timeline_metrics(mid: mido.MidiFile) -> tuple[float, float]:
     """Return source MIDI duration in seconds and fractional musical bars.
 
@@ -259,28 +337,73 @@ def clone_track(track: mido.MidiTrack) -> mido.MidiTrack:
     return out
 
 
+def clone_conductor_track(track: mido.MidiTrack) -> mido.MidiTrack:
+    """Clone global/meta events from a would-be conductor track only.
+
+    Most Type-1 MIDI files use track 0 purely as a conductor, so this is byte-
+    semantically equivalent for normal inputs. If a real-world file also puts
+    channel messages in track 0, those notes/controllers must not leak into
+    every split stem rendered from another physical track.
+    """
+    out = mido.MidiTrack()
+    pending_time = 0
+    for msg in track:
+        if hasattr(msg, "channel"):
+            pending_time += msg.time
+            continue
+        out.append(msg.copy(time=msg.time + pending_time))
+        pending_time = 0
+    return out
+
+
+def clone_track_for_channel(
+    track: mido.MidiTrack,
+    channel: int,
+    velocity_plan: VelocityPlan | None = None,
+) -> mido.MidiTrack:
+    """Clone one logical MIDI channel while preserving absolute event times.
+
+    Meta/system events are retained because tempo, meter and other global
+    timeline information may live in the same physical track (notably Type-0
+    files). Channel messages for other channels are removed and their delta
+    time is carried forward to the next retained event.
+    """
+    out = mido.MidiTrack()
+    pending_time = 0
+    for msg in track:
+        keep = not hasattr(msg, "channel") or msg.channel == channel
+        if not keep:
+            pending_time += msg.time
+            continue
+        copied = _copy_with_velocity(msg, velocity_plan)
+        out.append(copied.copy(time=msg.time + pending_time))
+        pending_time = 0
+    return out
+
+
 def make_split_midi(
     source: mido.MidiFile,
     source_path: Path,
     track_index: int,
     split_dir: Path,
     velocity_plan: VelocityPlan | None = None,
+    channel: int | None = None,
 ) -> Path:
-    """Keep conductor/meta track 0 plus exactly one musical track.
-
-    V1 assumes one MIDI track is one logical instrument. The analyzer reports
-    multi-program and multi-channel tracks so unusual files are visible rather
-    than silently split into a more complex routing model.
-    """
+    """Keep conductor/meta track 0 plus exactly one logical musical stem."""
     split_dir.mkdir(parents=True, exist_ok=True)
     out = mido.MidiFile(type=1, ticks_per_beat=source.ticks_per_beat)
 
     if len(source.tracks) > 0 and track_index != 0:
-        out.tracks.append(clone_track(source.tracks[0]))
-    out.tracks.append(clone_track_with_velocity_plan(source.tracks[track_index], velocity_plan))
+        out.tracks.append(clone_conductor_track(source.tracks[0]))
+    if channel is None:
+        musical = clone_track_with_velocity_plan(source.tracks[track_index], velocity_plan)
+    else:
+        musical = clone_track_for_channel(source.tracks[track_index], channel, velocity_plan)
+    out.tracks.append(musical)
 
     safe = source_path.stem.replace("/", "_")
-    output = split_dir / f"{safe}.track-{track_index:02d}.mid"
+    channel_suffix = "" if channel is None else f".ch-{channel + 1:02d}"
+    output = split_dir / f"{safe}.track-{track_index:02d}{channel_suffix}.mid"
     out.save(output)
     return output
 
@@ -319,17 +442,22 @@ def make_note_filtered_midi(
     notes: Iterable[int],
     suffix: str,
     velocity_plan: VelocityPlan | None = None,
+    channel: int | None = None,
 ) -> Path:
     """Keep conductor/meta track 0 plus selected notes from one musical track."""
     split_dir.mkdir(parents=True, exist_ok=True)
     out = mido.MidiFile(type=1, ticks_per_beat=source.ticks_per_beat)
 
     if len(source.tracks) > 0 and track_index != 0:
-        out.tracks.append(clone_track(source.tracks[0]))
-    out.tracks.append(clone_track_with_notes(source.tracks[track_index], notes, velocity_plan))
+        out.tracks.append(clone_conductor_track(source.tracks[0]))
+    source_track = source.tracks[track_index]
+    if channel is not None:
+        source_track = clone_track_for_channel(source_track, channel)
+    out.tracks.append(clone_track_with_notes(source_track, notes, velocity_plan))
 
     safe = source_path.stem.replace("/", "_")
-    output = split_dir / f"{safe}.track-{track_index:02d}.{suffix}.mid"
+    channel_suffix = "" if channel is None else f".ch-{channel + 1:02d}"
+    output = split_dir / f"{safe}.track-{track_index:02d}{channel_suffix}.{suffix}.mid"
     out.save(output)
     return output
 
@@ -387,16 +515,21 @@ def make_program_override_midi(
     program: int,
     suffix: str = "gm",
     velocity_plan: VelocityPlan | None = None,
+    channel: int | None = None,
 ) -> Path:
     """Keep conductor + one track, forcing a representative GM program."""
     split_dir.mkdir(parents=True, exist_ok=True)
     out = mido.MidiFile(type=1, ticks_per_beat=source.ticks_per_beat)
 
     if len(source.tracks) > 0 and track_index != 0:
-        out.tracks.append(clone_track(source.tracks[0]))
-    out.tracks.append(clone_track_with_program(source.tracks[track_index], program, velocity_plan))
+        out.tracks.append(clone_conductor_track(source.tracks[0]))
+    source_track = source.tracks[track_index]
+    if channel is not None:
+        source_track = clone_track_for_channel(source_track, channel)
+    out.tracks.append(clone_track_with_program(source_track, program, velocity_plan))
 
     safe = source_path.stem.replace("/", "_")
-    output = split_dir / f"{safe}.track-{track_index:02d}.{suffix}-p{program:03d}.mid"
+    channel_suffix = "" if channel is None else f".ch-{channel + 1:02d}"
+    output = split_dir / f"{safe}.track-{track_index:02d}{channel_suffix}.{suffix}-p{program:03d}.mid"
     out.save(output)
     return output
