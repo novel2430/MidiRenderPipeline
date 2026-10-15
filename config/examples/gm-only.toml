@@ -1,0 +1,77 @@
+# GM-only reference config for MidiRenderPipeline 0.5.0.
+# This file lives in config/examples/, so paths start with ../../resources.
+# Requires an installed SF2 and a discoverable libfluidsynth.
+# No dedicated SFZ patches and no LV2 effects are configured.
+
+[paths]
+instruments = "../../resources/instruments"
+lv2 = "../../resources/fx/lv2"
+tools = "../../resources/tools"
+
+[master]
+normalize_peak_db = -1.0
+gain_db = -10.0
+
+[melody]
+mode = "gm"
+gm_program = 71
+
+[general_midi_fallback]
+enabled = true
+soundfont = "MuseScore_General_Full.sf2"
+synth_gain = 0.2
+gain_db = 6.0
+
+# Use source Program Change when it is trustworthy; otherwise use these
+# representative choices for recognized instrument names.
+[general_midi_fallback.program_for_instrument]
+melody = 71
+acoustic_piano = 0
+electric_piano = 4
+chromatic_percussion = 11
+music_box = 10
+vibraphone = 11
+dulcimer = 15
+organ = 16
+accordion = 21
+harmonica = 22
+acoustic_guitar = 25
+electric_guitar_jazz = 26
+electric_guitar_clean = 27
+electric_guitar_muted = 28
+electric_guitar_overdrive = 29
+electric_guitar_distortion = 30
+electric_guitar_harmonics = 31
+electric_bass = 33
+drums = 0
+solo_violin = 40
+solo_viola = 41
+cello = 42
+contrabass = 43
+string_tremolo = 44
+string_pizzicato = 45
+harp = 46
+timpani = 47
+string_ensemble = 48
+choir = 52
+orchestra_hit = 55
+trumpet = 56
+trombone = 57
+tuba = 58
+muted_trumpet = 59
+horn = 60
+brass = 61
+saxophone = 65
+oboe = 68
+english_horn = 69
+bassoon = 70
+clarinet = 71
+piccolo = 72
+flute = 73
+wind = 73
+synth_lead = 80
+synth_pad = 89
+synth_fx = 96
+ethnic = 104
+percussion = 114
+sound_fx = 120

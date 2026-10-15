@@ -6,6 +6,20 @@ long-running coordinator for both modes, persistent RAM-resident sfizz workers
 for SFZ instruments, embedded `libfluidsynth` for GM fallback, and a
 project-native LV2 chain host for effects.
 
+## User guide / 使用者文檔
+
+If this is your first time using MRP, follow the [user documentation](docs/README.md)
+for installation, the patched sfizz build, custom TOML configurations,
+CLI recipes, and troubleshooting:
+
+- [Install, sfizz build & Resources download / 安裝、sfizz 編譯與資源下載](docs/INSTALL.md)
+- [Create your own `patches.toml` / 自訂配置](docs/CONFIGURATION.md)
+- [CLI usage & batch resume / 命令列與續跑](docs/CLI.md)
+- [Troubleshooting / 故障排查](docs/TROUBLESHOOTING.md)
+
+The following sections and [RENDERING_SYSTEM.md](RENDERING_SYSTEM.md) provide
+technical design and implementation details.
+
 ## Current architecture
 
 ```text
